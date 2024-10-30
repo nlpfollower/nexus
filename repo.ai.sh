@@ -1,0 +1,1 @@
+repopack --ignore "repo.ai.txt" -o repo.ai.txt --style xml
