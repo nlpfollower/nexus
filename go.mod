@@ -7,6 +7,8 @@ replace github.com/nlpfollower/deltamind/database => ./../database
 replace github.com/nlpfollower/deltamind/orchestration => ./../orchestration
 
 require (
+	github.com/google/uuid v1.6.0
+	github.com/joho/godotenv v1.5.1
 	github.com/nlpfollower/deltamind/database v0.0.0-00010101000000-000000000000
 	github.com/nlpfollower/deltamind/orchestration v0.0.0-00010101000000-000000000000
 	github.com/sashabaranov/go-openai v1.32.3
@@ -18,7 +20,6 @@ require (
 	github.com/boltdb/bolt v1.3.1 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
-	github.com/joho/godotenv v1.5.1 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect

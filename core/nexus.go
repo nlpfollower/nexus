@@ -7,7 +7,9 @@ import (
 	"github.com/nlpfollower/deltamind/database/db"
 	"github.com/nlpfollower/deltamind/orchestration/utils"
 	"log"
+	"strings"
 	"sync"
+	"time"
 )
 
 type activeGeneration struct {
@@ -20,21 +22,16 @@ type Config struct {
 	Port int
 }
 
-// Update the Nexus struct
 type Nexus struct {
-	queue       *MessageChannel
-	tracker     *RequestTracker
-	apiManager  *APIModelManager
-	sessionMgr  *SessionManager
-	connManager *ConnectionManager
+	queue            *MessageChannel
+	tracker          *RequestTracker
+	apiManager       *APIModelManager
+	orchestrationMgr *OrchestrationManager
+	connManager      *ConnectionManager
 
 	// Add generation tracking
 	// key is requestID.String()
 	activeGenerations *utils.ConcurrentMap[string, *activeGeneration]
-
-	// Channels for coordination
-	sessionActiveCh  chan string
-	directResponseCh chan *Request
 
 	wg        sync.WaitGroup
 	done      chan struct{}
@@ -49,14 +46,18 @@ func NewNexus(cfg *Config) (*Nexus, error) {
 
 	queue := NewMessageChannel(1000, 1000)
 
+	// Create orchestration manager with default 30 minute expiration
+	orchestrationMgr, err := NewOrchestrationManager(30 * time.Minute)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create orchestration manager: %w", err)
+	}
+
 	nexus := &Nexus{
 		queue:             queue,
 		tracker:           NewRequestTracker(),
 		apiManager:        apiManager,
-		sessionMgr:        NewSessionManager(),
+		orchestrationMgr:  orchestrationMgr,
 		activeGenerations: utils.NewConcurrentMap[string, *activeGeneration](),
-		sessionActiveCh:   make(chan string, 100),
-		directResponseCh:  make(chan *Request, 1000),
 		done:              make(chan struct{}),
 	}
 
@@ -75,18 +76,14 @@ func (n *Nexus) Start() error {
 		return fmt.Errorf("failed to start connection manager: %w", err)
 	}
 
+	// Start orchestration manager
+	n.orchestrationMgr.Start()
+
 	// Start request processing loop
 	n.wg.Add(1)
 	go func() {
 		defer n.wg.Done()
 		n.requestLoop()
-	}()
-
-	// Start response handling loop
-	n.wg.Add(1)
-	go func() {
-		defer n.wg.Done()
-		n.responseLoop()
 	}()
 
 	return nil
@@ -107,12 +104,13 @@ func (n *Nexus) Stop() {
 			gen.stream.Stop()
 		}
 
+		// Stop orchestration manager
+		n.orchestrationMgr.Stop()
+
 		// Wait for all goroutines to finish
 		n.wg.Wait()
 
-		// Now it's safe to close channels
-		close(n.sessionActiveCh)
-		close(n.directResponseCh)
+		// Close the request tracker
 		n.queue.Close()
 	})
 }
@@ -155,6 +153,7 @@ func (n *Nexus) sendWrappedResponse(req *Request, resp NexusResponse) {
 // ====================
 // Request handling
 // ====================
+// requestLoop processes incoming requests
 func (n *Nexus) requestLoop() {
 	requestChan := n.queue.GetRequestChannel()
 
@@ -166,35 +165,37 @@ func (n *Nexus) requestLoop() {
 			if !ok {
 				return
 			}
-			if err := n.processRequest(req); err != nil {
-				log.Printf("Error processing request: %v", err)
-			}
+			// Process the request directly
+			go func(req *Request) {
+				if err := n.processRequest(req); err != nil {
+					log.Printf("Error processing request: %v", err)
+					n.sendErrorResponse(req, err)
+				}
+			}(req)
 		}
 	}
 }
 
+// processRequest handles a request based on its type
 func (n *Nexus) processRequest(req *Request) error {
 	n.tracker.AddRequest(req)
 
 	switch req.Type {
 	case RequestTypeInference:
-		if err := n.routeInferenceRequest(req); err != nil {
-			log.Printf("Error routing inference request %s: %v", req.RequestID, err)
-			n.sendErrorResponse(req, err)
-		}
+		return n.handleInference(req)
 	case RequestTypeSetUser:
-		// User requests can be handled immediately
-		n.directResponseCh <- req
+		return n.handleSetUser(req)
+	case RequestTypeSession:
+		return n.handleSessionRequest(req)
+	case RequestTypeJobStatus:
+		return n.handleJobStatus(req)
 	default:
-		err := fmt.Errorf("unknown request type: %s", req.Type)
-		log.Printf("Error processing request: %v", err)
-		n.sendErrorResponse(req, err)
+		return fmt.Errorf("unknown request type: %s", req.Type)
 	}
-
-	return nil
 }
 
-func (n *Nexus) routeInferenceRequest(req *Request) error {
+// handleInference processes an inference request
+func (n *Nexus) handleInference(req *Request) error {
 	inferReq, ok := req.Data.(*InferenceRequest)
 	if !ok {
 		return fmt.Errorf("invalid inference request data")
@@ -202,65 +203,199 @@ func (n *Nexus) routeInferenceRequest(req *Request) error {
 
 	// Check if this is an API model
 	if n.apiManager.IsAPIModel(inferReq.ModelID) {
-		n.directResponseCh <- req
-		return nil
+		return n.handleAPIInference(req)
 	}
 
-	// Handle infrastructure-based model request
-	session, err := n.sessionMgr.GetOrCreateSession(inferReq.ModelID)
+	// Get or create an inference session for this model
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	session, err := n.orchestrationMgr.GetOrCreateInferenceSession(ctx, inferReq.ModelID.String())
 	if err != nil {
-		return fmt.Errorf("failed to get/create session: %w", err)
+		return fmt.Errorf("failed to get/create inference session: %w", err)
 	}
 
-	if session.Status == SessionStatusRunning {
-		n.sessionActiveCh <- session.ID
+	// Process the inference request
+	stream, err := session.ProcessInference(ctx, inferReq.Messages)
+	if err != nil {
+		return fmt.Errorf("failed to process inference: %w", err)
 	}
 
+	// Track the active generation
+	n.activeGenerations.Set(req.RequestID.String(), &activeGeneration{
+		stream:       stream,
+		requestID:    req.RequestID,
+		connectionID: req.ConnectionID,
+	})
+
+	// Start handling the stream
+	go n.handleInferenceStream(req, stream)
 	return nil
 }
 
-// ====================
-// Response handling
-// ====================
-func (n *Nexus) responseLoop() {
-	for {
-		select {
-		case <-n.done:
-			return
-		case sessionID := <-n.sessionActiveCh:
-			if session, ok := n.sessionMgr.GetSession(sessionID); ok {
-				go n.handleSessionProcessing(session)
-			}
-		case req := <-n.directResponseCh:
-			go n.handleDirectRequest(req)
-		}
-	}
-}
-
-func (n *Nexus) handleDirectRequest(req *Request) {
-	var err error
-	switch req.Type {
-	case RequestTypeInference:
-		err = n.handleAPIInference(req)
-	case RequestTypeSetUser:
-		err = n.handleSetUser(req)
-	default:
-		err = fmt.Errorf("unknown request type: %s", req.Type)
+// User response handling
+func (n *Nexus) handleSetUser(req *Request) error {
+	userReq, ok := req.Data.(*SetUserRequest)
+	if !ok {
+		return fmt.Errorf("invalid set user request data")
 	}
 
+	n.tracker.AddUser(userReq.UserID)
+
+	resp := &SetUserResponse{Status: ResponseStatusSuccess}
+	wrapped, err := NewWrappedResponse(req.RequestID, resp)
 	if err != nil {
-		n.sendErrorResponse(req, err)
+		return fmt.Errorf("failed to wrap response: %w", err)
 	}
+
+	n.queue.EnqueueResponse(wrapped, req.ConnectionID)
+	return nil
 }
 
-// Inference response handling
-func (n *Nexus) handleSessionProcessing(session *Session) {
-	// TODO: Implementation for infrastructure-based processing
-	// This will:
-	// 1. Collect requests into batches
-	// 2. Process batches through infrastructure
-	// 3. Stream responses back to clients
-	log.Printf("Session %s ready for processing (not yet implemented)", session.ID)
+func (n *Nexus) handleSessionRequest(req *Request) error {
+	sessionReq, ok := req.Data.(*SessionRequest)
+	if !ok {
+		return fmt.Errorf("invalid session request data")
+	}
+
+	ctx := context.Background()
+	var response SessionResponse
+
+	switch sessionReq.Action {
+	case SessionActionStart:
+		// Start a new inference job
+		config := InferenceConfig{
+			DCPDir:           fmt.Sprintf("/mnt/cold/contents/dcp/%s/step-0", sessionReq.ModelID.String()),
+			TokenizerPath:    "/mnt/cold/contents/checkpoints/Llama3.1-8B-Instruct/tokenizer.model",
+			ParamsPath:       "torchchat/model_params/Meta-Llama-3.1-8B.json",
+			Port:             5000,
+			DCPModelSize:     "8B",
+			CheckpointFolder: sessionReq.ModelID.String(),
+			NodeCount:        1,
+			RaidMountPath:    "/mnt/cold",
+			RaidName:         "cold-new",
+		}
+
+		job, err := n.orchestrationMgr.StartInferenceJob(ctx, sessionReq.ModelID.String(), config)
+		if err != nil {
+			return fmt.Errorf("failed to start inference job: %w", err)
+		}
+
+		// Wait for job to be ready
+		readyCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+		defer cancel()
+
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-readyCtx.Done():
+				return fmt.Errorf("timeout waiting for inference job to start")
+			case <-ticker.C:
+				job.mu.RLock()
+				status := job.Status
+				endpoint := job.Endpoint
+				job.mu.RUnlock()
+
+				if status == JobStatusRunning && endpoint != "" {
+					response = SessionResponse{
+						Status:    ResponseStatusSuccess,
+						SessionID: job.ID,
+						Endpoint:  endpoint,
+					}
+					goto sendResponse
+				} else if status == JobStatusError {
+					return fmt.Errorf("inference job failed to start")
+				}
+			}
+		}
+
+	case SessionActionStop:
+		if sessionReq.SessionID == "" {
+			return fmt.Errorf("session_id is required for stopping a session")
+		}
+
+		// Stop the specified job
+		if err := n.orchestrationMgr.StopJob(ctx, sessionReq.SessionID); err != nil {
+			return fmt.Errorf("failed to stop job: %w", err)
+		}
+
+		response = SessionResponse{
+			Status:    ResponseStatusSuccess,
+			SessionID: sessionReq.SessionID,
+		}
+
+	case SessionActionExtend:
+		if sessionReq.SessionID == "" {
+			return fmt.Errorf("session_id is required for extending a session")
+		}
+
+		// Parse duration if provided
+		var duration time.Duration
+		if sessionReq.Duration != "" {
+			var err error
+			duration, err = time.ParseDuration(sessionReq.Duration)
+			if err != nil {
+				return fmt.Errorf("invalid duration format: %w", err)
+			}
+		} else {
+			duration = 30 * time.Minute // default extension
+		}
+
+		// Extend the specified job
+		if err := n.orchestrationMgr.ExtendJob(sessionReq.SessionID, duration); err != nil {
+			return fmt.Errorf("failed to extend job: %w", err)
+		}
+
+		// Get the job to return its details
+		job, ok := n.orchestrationMgr.GetJob(sessionReq.SessionID)
+		if !ok {
+			return fmt.Errorf("job not found after extension: %s", sessionReq.SessionID)
+		}
+
+		job.mu.RLock()
+		endpoint := job.Endpoint
+		job.mu.RUnlock()
+
+		response = SessionResponse{
+			Status:    ResponseStatusSuccess,
+			SessionID: job.ID,
+			Endpoint:  endpoint,
+		}
+
+	default:
+		return fmt.Errorf("unknown session action: %s", sessionReq.Action)
+	}
+
+sendResponse:
+	// Send the response
+	n.sendWrappedResponse(req, &response)
+	return nil
+}
+
+func (n *Nexus) handleJobStatus(req *Request) error {
+	jobReq, ok := req.Data.(*JobStatusRequest)
+	if !ok {
+		return fmt.Errorf("invalid job status request data")
+	}
+
+	info, err := n.orchestrationMgr.GetJobStatus(context.Background(), jobReq.JobID)
+	if err != nil {
+		resp := &JobStatusResponse{
+			Status: ResponseStatusError,
+			Error:  err.Error(),
+		}
+		n.sendWrappedResponse(req, resp)
+		return nil
+	}
+
+	resp := &JobStatusResponse{
+		Status:  ResponseStatusSuccess,
+		JobInfo: info,
+	}
+	n.sendWrappedResponse(req, resp)
+	return nil
 }
 
 func (n *Nexus) handleAPIInference(req *Request) error {
@@ -306,21 +441,37 @@ func (n *Nexus) handleInferenceStream(req *Request, stream GenerationStream) {
 		return
 	}
 
+	log.Printf("Starting to process stream for request %s", key)
+
 	responseChan := stream.ResponseChan()
 	for {
 		select {
 		case <-n.done:
+			log.Printf("Nexus shutting down, stopping generation %s", key)
 			return
+
 		case resp, ok := <-responseChan:
 			if !ok {
+				log.Printf("Response channel closed for %s, sending final response", key)
 				n.sendFinalResponse(req)
 				return
 			}
+
 			if resp.Error != nil {
+				// Don't treat context canceled as a real error
+				if strings.Contains(resp.Error.Error(), "context canceled") {
+					log.Printf("Context canceled for %s, sending final response", key)
+					n.sendFinalResponse(req)
+					return
+				}
+
+				log.Printf("Error from generation %s: %v", key, resp.Error)
 				n.sendErrorResponse(req, resp.Error)
 				return
 			}
+
 			if resp.Content != "" {
+				log.Printf("Received content chunk for %s: %q", key, resp.Content)
 				n.sendPartialResponse(req, resp.Content)
 			}
 		}
@@ -345,37 +496,35 @@ func (n *Nexus) sendFinalResponse(req *Request) {
 	n.sendWrappedResponse(req, resp)
 }
 
-// User response handling
-func (n *Nexus) handleSetUser(req *Request) error {
-	userReq, ok := req.Data.(*SetUserRequest)
-	if !ok {
-		return fmt.Errorf("invalid set user request data")
-	}
-
-	n.tracker.AddUser(userReq.UserID)
-
-	resp := &SetUserResponse{Status: ResponseStatusSuccess}
-	wrapped, err := NewWrappedResponse(req.RequestID, resp)
-	if err != nil {
-		return fmt.Errorf("failed to wrap response: %w", err)
-	}
-
-	n.queue.EnqueueResponse(wrapped, req.ConnectionID)
-	return nil
-}
-
 func (n *Nexus) sendErrorResponse(req *Request, err error) {
 	var resp NexusResponse
+
+	// Don't treat context cancellation as a real error
+	errorContent := err.Error()
+	if strings.Contains(errorContent, "context canceled") {
+		errorContent = ""
+	}
+
 	switch req.Type {
 	case RequestTypeInference:
 		resp = &InferenceResponse{
 			Type:    ResponseTypeFinal,
-			Content: err.Error(),
+			Content: errorContent,
 			Status:  ResponseStatusError,
 		}
 	case RequestTypeSetUser:
 		resp = &SetUserResponse{
 			Status: ResponseStatusError,
+		}
+	case RequestTypeSession:
+		resp = &SessionResponse{
+			Status: ResponseStatusError,
+			Error:  errorContent,
+		}
+	case RequestTypeJobStatus:
+		resp = &JobStatusResponse{
+			Status: ResponseStatusError,
+			Error:  errorContent,
 		}
 	default:
 		log.Printf("Cannot send error response for unknown request type: %s", req.Type)

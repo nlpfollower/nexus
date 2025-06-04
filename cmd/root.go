@@ -14,7 +14,8 @@ import (
 )
 
 var (
-	port int
+	port                 int
+	persistentSessionURL string
 )
 
 var rootCmd = &cobra.Command{
@@ -31,6 +32,7 @@ func init() {
 	}
 
 	rootCmd.Flags().IntVarP(&port, "port", "p", 8081, "Port to listen on")
+	rootCmd.Flags().StringVarP(&persistentSessionURL, "session", "s", "", "URL for a persistent inference session (e.g. http://localhost:5000)")
 }
 
 func runServer(cmd *cobra.Command, args []string) error {

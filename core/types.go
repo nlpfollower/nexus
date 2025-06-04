@@ -1,3 +1,4 @@
+// core/types.go
 package core
 
 import (
@@ -23,6 +24,8 @@ type ResponseStatus string
 const (
 	RequestTypeInference RequestType = "INFERENCE"
 	RequestTypeSetUser   RequestType = "SET_USER"
+	RequestTypeSession   RequestType = "SESSION"
+	RequestTypeJobStatus RequestType = "JOB_STATUS"
 
 	RequestStatusPending    RequestStatus = "PENDING"
 	RequestStatusAllocated  RequestStatus = "ALLOCATED"
@@ -35,6 +38,38 @@ const (
 
 	ResponseStatusSuccess ResponseStatus = "SUCCESS"
 	ResponseStatusError   ResponseStatus = "ERROR"
+)
+
+// OrchestrationJobType represents the type of orchestration job
+type OrchestrationJobType string
+
+const (
+	JobTypeInference OrchestrationJobType = "inference"
+	JobTypeTraining  OrchestrationJobType = "training"
+)
+
+// OrchestrationJobStatus represents the status of a job
+type OrchestrationJobStatus string
+
+const (
+	JobStatusPending      OrchestrationJobStatus = "pending"
+	JobStatusInitializing OrchestrationJobStatus = "initializing"
+	JobStatusRunning      OrchestrationJobStatus = "running"
+	JobStatusStopping     OrchestrationJobStatus = "stopping"
+	JobStatusStopped      OrchestrationJobStatus = "stopped"
+	JobStatusError        OrchestrationJobStatus = "error"
+	JobStatusExpired      OrchestrationJobStatus = "expired"
+)
+
+// Session status types (used by session.go)
+type SessionStatus string
+
+const (
+	SessionStatusInitializing SessionStatus = "INITIALIZING"
+	SessionStatusRunning      SessionStatus = "RUNNING"
+	SessionStatusStopping     SessionStatus = "STOPPING"
+	SessionStatusStopped      SessionStatus = "STOPPED"
+	SessionStatusError        SessionStatus = "ERROR"
 )
 
 // Client-facing request types
@@ -86,6 +121,70 @@ type SetUserResponse struct {
 
 func (r *SetUserResponse) NexusResponseType() RequestType {
 	return RequestTypeSetUser
+}
+
+// Session management types
+type SessionAction string
+
+const (
+	SessionActionStart  SessionAction = "START"
+	SessionActionStop   SessionAction = "STOP"
+	SessionActionExtend SessionAction = "EXTEND"
+)
+
+type SessionRequest struct {
+	Action    SessionAction `json:"action"`
+	ModelID   db.Digest     `json:"model_id,omitempty"`   // Required for START
+	SessionID string        `json:"session_id,omitempty"` // Required for STOP and EXTEND
+	Duration  string        `json:"duration,omitempty"`   // Optional for EXTEND, format like "30m"
+}
+
+func (r *SessionRequest) NexusRequestType() RequestType {
+	return RequestTypeSession
+}
+
+type SessionResponse struct {
+	Status    ResponseStatus `json:"status"`
+	SessionID string         `json:"session_id,omitempty"`
+	Endpoint  string         `json:"endpoint,omitempty"`
+	Error     string         `json:"error,omitempty"`
+}
+
+func (r *SessionResponse) NexusResponseType() RequestType {
+	return RequestTypeSession
+}
+
+// Job status types
+type JobStatusRequest struct {
+	JobID string `json:"job_id"`
+}
+
+func (r *JobStatusRequest) NexusRequestType() RequestType {
+	return RequestTypeJobStatus
+}
+
+type JobStatusResponse struct {
+	Status  ResponseStatus `json:"status"`
+	JobInfo *JobStatusInfo `json:"job_info,omitempty"`
+	Error   string         `json:"error,omitempty"`
+}
+
+func (r *JobStatusResponse) NexusResponseType() RequestType {
+	return RequestTypeJobStatus
+}
+
+// JobStatusInfo contains detailed status information about a job
+type JobStatusInfo struct {
+	ID         string                 `json:"id"`
+	Type       OrchestrationJobType   `json:"type"`
+	Status     OrchestrationJobStatus `json:"status"`
+	ModelID    string                 `json:"model_id"`
+	CreatedAt  time.Time              `json:"created_at"`
+	StartedAt  *time.Time             `json:"started_at,omitempty"`
+	StoppedAt  *time.Time             `json:"stopped_at,omitempty"`
+	Expiration time.Time              `json:"expiration"`
+	Endpoint   string                 `json:"endpoint,omitempty"`
+	LiveStatus map[string]interface{} `json:"live_status,omitempty"`
 }
 
 type Message struct {
@@ -167,6 +266,36 @@ func UnwrapRequest(wrapped *WrappedRequest, connID string) (*Request, error) {
 			ConnectionID: connID,
 			Status:       RequestStatusPending,
 			Data:         &userReq,
+			CreatedAt:    time.Now(),
+		}, nil
+
+	case RequestTypeSession:
+		var sessionReq SessionRequest
+		if err := json.Unmarshal(wrapped.Data, &sessionReq); err != nil {
+			return nil, err
+		}
+
+		return &Request{
+			RequestID:    wrapped.RequestID,
+			Type:         RequestTypeSession,
+			ConnectionID: connID,
+			Status:       RequestStatusPending,
+			Data:         &sessionReq,
+			CreatedAt:    time.Now(),
+		}, nil
+
+	case RequestTypeJobStatus:
+		var jobReq JobStatusRequest
+		if err := json.Unmarshal(wrapped.Data, &jobReq); err != nil {
+			return nil, err
+		}
+
+		return &Request{
+			RequestID:    wrapped.RequestID,
+			Type:         RequestTypeJobStatus,
+			ConnectionID: connID,
+			Status:       RequestStatusPending,
+			Data:         &jobReq,
 			CreatedAt:    time.Now(),
 		}, nil
 	}
