@@ -21,7 +21,7 @@ func orchestrationDirExists() bool {
 		return false
 	}
 
-	orchestrationDir := filepath.Join(homeDir, "workspace", "orchestration")
+	orchestrationDir := filepath.Join(homeDir, "orchestration")
 	_, err = os.Stat(orchestrationDir)
 	return err == nil
 }

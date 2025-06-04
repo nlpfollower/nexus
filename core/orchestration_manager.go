@@ -66,7 +66,7 @@ func NewOrchestrationManager(defaultExpiration time.Duration) (*OrchestrationMan
 		return nil, fmt.Errorf("failed to get home directory: %w", err)
 	}
 
-	orchestrationDir := filepath.Join(homeDir, "workspace", "orchestration")
+	orchestrationDir := filepath.Join(homeDir, "orchestration")
 	if _, err := os.Stat(orchestrationDir); os.IsNotExist(err) {
 		return nil, fmt.Errorf("orchestration directory not found at %s", orchestrationDir)
 	}
@@ -365,7 +365,6 @@ func (m *OrchestrationManager) startInferenceProcess(ctx context.Context, job *O
 		"--checkpoint-folder", config.CheckpointFolder,
 		"--node-count", fmt.Sprintf("%d", config.NodeCount),
 		"--skip-cluster-creation",
-		"--silent-mode",
 	}
 
 	if config.RaidMountPath != "" {
@@ -493,7 +492,7 @@ func (m *OrchestrationManager) stopInferenceProcess(ctx context.Context, job *Or
 func (m *OrchestrationManager) checkInferenceStatus(ctx context.Context) (map[string]interface{}, error) {
 	args := []string{
 		"mindlet", "inference", "status",
-		"--skip-cluster-creation",
+		"--skip-cluster-creation", "--silent-mode",
 	}
 
 	output, err := m.executeOrchestrationCommand(ctx, args...)
