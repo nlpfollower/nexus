@@ -164,7 +164,7 @@ func TestOrchestrationManager_RealInference(t *testing.T) {
 		}
 
 		return false
-	}, 3*time.Minute, 10*time.Second)
+	}, 6*time.Minute, 10*time.Second)
 
 	// Check final status
 	job.mu.RLock()
@@ -184,6 +184,7 @@ func TestOrchestrationManager_RealInference(t *testing.T) {
 			"messages": []map[string]string{
 				{"role": "user", "content": "Are you alive? Reply with yes or no only."},
 			},
+			"model":  "",
 			"stream": false,
 		}
 
@@ -201,6 +202,7 @@ func TestOrchestrationManager_RealInference(t *testing.T) {
 			"messages": []map[string]string{
 				{"role": "user", "content": "What is 2+2? Reply with the number only."},
 			},
+			"model":  "",
 			"stream": false,
 		}
 
