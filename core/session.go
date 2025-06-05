@@ -37,11 +37,12 @@ type InferenceEndpointRequest struct {
 
 // InferenceEndpointResponse represents a streaming response from the endpoint
 type InferenceEndpointResponse struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Created int64  `json:"created"`
-	Model   string `json:"model"`
-	Choices []struct {
+	ID                string `json:"id"`
+	Object            string `json:"object"`
+	Created           int64  `json:"created"`
+	Model             string `json:"model,omitempty"`
+	SystemFingerprint string `json:"system_fingerprint,omitempty"`
+	Choices           []struct {
 		Index int `json:"index"`
 		Delta struct {
 			Role    string `json:"role,omitempty"`
