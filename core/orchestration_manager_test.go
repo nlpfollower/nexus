@@ -2,6 +2,7 @@
 package core
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -477,4 +478,71 @@ func TestOrchestrationManager_StreamingInference(t *testing.T) {
 		defer job.mu.RUnlock()
 		return job.Status == JobStatusStopped
 	}, 30*time.Second, 2*time.Second)
+}
+
+func TestDirectStreamingHTTP(t *testing.T) {
+	if os.Getenv("RUN_INFERENCE_TEST") != "true" {
+		t.Skip("Skipping direct streaming test. Set RUN_INFERENCE_TEST=true to run.")
+	}
+
+	// This test assumes the server is already running at the endpoint
+	endpoint := "http://192.168.172.13:5000" // Update this to match your server
+
+	// Create request body
+	reqBody := map[string]interface{}{
+		"stream": true,
+		"model":  "",
+		"messages": []Message{
+			{Role: "user", Content: "Say hello in 3 words"},
+		},
+	}
+
+	jsonBody, err := json.Marshal(reqBody)
+	require.NoError(t, err)
+
+	// Create HTTP request
+	req, err := http.NewRequest("POST", endpoint+"/v1/chat/completions", bytes.NewBuffer(jsonBody))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+
+	// Send request
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	t.Logf("Response status: %s", resp.Status)
+	t.Logf("Response headers: %v", resp.Header)
+
+	// Read response body
+	scanner := bufio.NewScanner(resp.Body)
+	lineCount := 0
+	chunkCount := 0
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		lineCount++
+		t.Logf("Line %d: %q", lineCount, line)
+
+		if strings.HasPrefix(line, "data:") {
+			chunkCount++
+			jsonData := strings.TrimPrefix(line, "data:")
+			jsonData = strings.TrimSpace(jsonData)
+
+			var data map[string]interface{}
+			if err := json.Unmarshal([]byte(jsonData), &data); err != nil {
+				t.Logf("Failed to parse JSON: %v", err)
+			} else {
+				t.Logf("Parsed chunk %d: %+v", chunkCount, data)
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		t.Logf("Scanner error: %v", err)
+	}
+
+	t.Logf("Total lines: %d, chunks: %d", lineCount, chunkCount)
+	require.Greater(t, chunkCount, 0, "Should have received at least one chunk")
 }
