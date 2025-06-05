@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -545,4 +546,71 @@ func TestDirectStreamingHTTP(t *testing.T) {
 
 	t.Logf("Total lines: %d, chunks: %d", lineCount, chunkCount)
 	require.Greater(t, chunkCount, 0, "Should have received at least one chunk")
+}
+
+func TestSessionDirectStreaming(t *testing.T) {
+	if os.Getenv("RUN_INFERENCE_TEST") != "true" {
+		t.Skip("Skipping direct session test. Set RUN_INFERENCE_TEST=true to run.")
+	}
+
+	// Create a session directly with a known endpoint
+	endpoint, err := url.Parse("http://192.168.160.114:5000") // Update this IP
+	require.NoError(t, err)
+
+	session := &InferenceSession{
+		ID:           "test-session",
+		ModelID:      "test-model",
+		Status:       SessionStatusRunning,
+		Endpoint:     endpoint,
+		Expiration:   time.Now().Add(5 * time.Minute),
+		IsPersistent: false,
+		httpClient:   &http.Client{Timeout: 60 * time.Second},
+	}
+
+	ctx := context.Background()
+	messages := []Message{
+		{Role: "user", Content: "Say hello in 3 words"},
+	}
+
+	// Process inference
+	stream, err := session.ProcessInference(ctx, messages)
+	require.NoError(t, err)
+	require.NotNil(t, stream)
+
+	// Collect responses
+	var chunks []string
+	responseCount := 0
+
+	t.Log("Starting to read from stream...")
+
+	// Use a timeout
+	timeout := time.After(30 * time.Second)
+	done := make(chan bool)
+
+	go func() {
+		for resp := range stream.ResponseChan() {
+			if resp.Error != nil {
+				t.Logf("Stream error: %v", resp.Error)
+				continue
+			}
+
+			if resp.Content != "" {
+				responseCount++
+				chunks = append(chunks, resp.Content)
+				t.Logf("Chunk %d: %q", responseCount, resp.Content)
+			}
+		}
+		done <- true
+	}()
+
+	select {
+	case <-done:
+		t.Log("Stream completed")
+	case <-timeout:
+		t.Log("Stream timeout")
+		stream.Stop()
+	}
+
+	t.Logf("Received %d chunks: %v", responseCount, chunks)
+	require.Greater(t, responseCount, 0, "Should have received at least one chunk")
 }
