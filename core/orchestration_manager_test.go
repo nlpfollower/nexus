@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -329,4 +330,139 @@ func TestOrchestrationManager_TimeoutScenario(t *testing.T) {
 	} else {
 		t.Log("Server failed to start, skipping timeout test")
 	}
+}
+
+func TestOrchestrationManager_StreamingInference(t *testing.T) {
+	if os.Getenv("RUN_INFERENCE_TEST") != "true" {
+		t.Skip("Skipping streaming inference test. Set RUN_INFERENCE_TEST=true to run.")
+	}
+
+	if !orchestrationDirExists() {
+		t.Skip("Orchestration directory not found")
+	}
+
+	// Start the orchestration manager
+	manager, err := NewOrchestrationManager(10 * time.Minute)
+	require.NoError(t, err)
+
+	manager.Start()
+	defer manager.Stop()
+
+	ctx := context.Background()
+
+	config := InferenceConfig{
+		DCPDir:           "/mnt/cold/contents/dcp/llama-8b/step-0",
+		TokenizerPath:    "/mnt/cold/contents/checkpoints/Llama3.1-8B-Instruct/tokenizer.model",
+		ParamsPath:       "torchchat/model_params/Meta-Llama-3.1-8B.json",
+		Port:             5000,
+		DCPModelSize:     "8B",
+		CheckpointFolder: "llama-8b",
+		NodeCount:        1,
+		RaidMountPath:    "/mnt/cold",
+		RaidName:         "cold-new",
+	}
+
+	t.Log("Starting inference server for streaming test...")
+
+	job, err := manager.StartInferenceJob(ctx, "llama-8b", config)
+	require.NoError(t, err)
+
+	// Wait for server to be ready (up to 3 minutes)
+	require.Eventually(t, func() bool {
+		job.mu.RLock()
+		status := job.Status
+		endpoint := job.Endpoint
+		job.mu.RUnlock()
+
+		if status == JobStatusRunning && endpoint != "" {
+			t.Logf("Server is running at %s", endpoint)
+			return true
+		}
+
+		if status == JobStatusError {
+			job.mu.RLock()
+			lastErr := job.LastError
+			job.mu.RUnlock()
+			t.Logf("Server failed to start: %v", lastErr)
+			return true // Stop waiting
+		}
+
+		return false
+	}, 6*time.Minute, 10*time.Second)
+
+	// Check final status
+	job.mu.RLock()
+	finalStatus := job.Status
+	endpoint := job.Endpoint
+	job.mu.RUnlock()
+
+	require.Equal(t, JobStatusRunning, finalStatus, "Server should be running")
+	require.NotEmpty(t, endpoint, "Endpoint should be set")
+
+	// Now test streaming with the running server
+	t.Log("Server ready, testing streaming...")
+
+	// Get the session that was created
+	session, err := manager.GetOrCreateInferenceSession(ctx, "llama-8b")
+	require.NoError(t, err)
+	require.NotNil(t, session)
+
+	// Create messages for streaming test
+	messages := []Message{
+		{Role: "user", Content: "Count from 1 to 5, one number per line."},
+	}
+
+	// Process inference with streaming
+	stream, err := session.ProcessInference(ctx, messages)
+	require.NoError(t, err)
+	require.NotNil(t, stream)
+
+	// Collect streamed responses
+	var fullResponse strings.Builder
+	responseCount := 0
+
+	t.Log("Receiving streamed responses...")
+
+	for resp := range stream.ResponseChan() {
+		if resp.Error != nil {
+			t.Fatalf("Stream error: %v", resp.Error)
+		}
+
+		if resp.Content != "" {
+			fullResponse.WriteString(resp.Content)
+			responseCount++
+			// Only log first few chunks to avoid spam
+			if responseCount <= 5 {
+				t.Logf("Chunk %d: %q", responseCount, resp.Content)
+			}
+		}
+	}
+
+	finalResponse := fullResponse.String()
+	t.Logf("Full response (%d chunks): %s", responseCount, finalResponse)
+
+	// Verify we got a streamed response
+	require.Greater(t, responseCount, 1, "Should receive multiple chunks for streaming")
+	require.NotEmpty(t, finalResponse, "Should have received content")
+
+	// The response should contain numbers 1-5
+	require.Contains(t, finalResponse, "1")
+	require.Contains(t, finalResponse, "2")
+	require.Contains(t, finalResponse, "3")
+	require.Contains(t, finalResponse, "4")
+	require.Contains(t, finalResponse, "5")
+
+	t.Log("Streaming test completed successfully!")
+
+	// Clean up - stop the server
+	t.Log("Stopping inference server...")
+	err = manager.StopJob(ctx, job.ID)
+	require.NoError(t, err)
+
+	// Wait for it to stop
+	require.Eventually(t, func() bool {
+		job.mu.RLock()
+		defer job.mu.RUnlock()
+		return job.Status == JobStatusStopped
+	}, 30*time.Second, 2*time.Second)
 }

@@ -84,7 +84,7 @@ func (s *InferenceSession) ProcessInference(ctx context.Context, messages []Mess
 	// Create the request body
 	reqBody := InferenceEndpointRequest{
 		Stream:   true,
-		Model:    s.ModelID,
+		Model:    "", // Keep model field empty as required by the inference server
 		Messages: messages,
 	}
 
