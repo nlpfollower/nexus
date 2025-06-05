@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -613,4 +614,122 @@ func TestSessionDirectStreaming(t *testing.T) {
 
 	t.Logf("Received %d chunks: %v", responseCount, chunks)
 	require.Greater(t, responseCount, 0, "Should have received at least one chunk")
+}
+
+// Test to see how the raw stream data comes in
+func TestRawStreamReading(t *testing.T) {
+	if os.Getenv("RUN_INFERENCE_TEST") != "true" {
+		t.Skip("Skipping raw stream test. Set RUN_INFERENCE_TEST=true to run.")
+	}
+
+	endpoint := "http://192.168.164.222:5000" // Update this IP
+
+	// Create request
+	reqBody := map[string]interface{}{
+		"stream": true,
+		"model":  "",
+		"messages": []Message{
+			{Role: "user", Content: "Count to 3"},
+		},
+	}
+
+	jsonBody, _ := json.Marshal(reqBody)
+
+	req, err := http.NewRequest("POST", endpoint+"/v1/chat/completions", bytes.NewBuffer(jsonBody))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	t.Log("Starting to read stream...")
+
+	// List to collect all messages
+	var messages []map[string]interface{}
+
+	// Read SSE messages
+	reader := bufio.NewReader(resp.Body)
+	for {
+		// Read lines until we get a complete SSE message
+		var sseMessage strings.Builder
+		hasData := false
+
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				if err == io.EOF {
+					t.Log("Stream ended")
+					goto done
+				}
+				t.Logf("Read error: %v", err)
+				goto done
+			}
+
+			// Check if this line contains data
+			if strings.HasPrefix(line, "data:") {
+				hasData = true
+			}
+
+			sseMessage.WriteString(line)
+
+			// SSE messages are separated by empty lines
+			if line == "\n" && hasData {
+				break
+			}
+		}
+
+		// Process the SSE message
+		fullMessage := sseMessage.String()
+		lines := strings.Split(fullMessage, "\n")
+
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "data:") {
+				dataContent := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+
+				// Skip [DONE] message
+				if dataContent == "[DONE]" {
+					t.Log("Received [DONE] signal")
+					goto done
+				}
+
+				// Parse JSON
+				var message map[string]interface{}
+				if err := json.Unmarshal([]byte(dataContent), &message); err != nil {
+					t.Logf("Failed to parse JSON: %v", err)
+					continue
+				}
+
+				// Add to messages list
+				messages = append(messages, message)
+
+				// Log for debugging (only first few)
+				if len(messages) <= 10 {
+					t.Logf("Message %d: %+v", len(messages), message)
+				}
+
+				// Check for stop signal
+				if choices, ok := message["choices"].([]interface{}); ok && len(choices) > 0 {
+					if choice, ok := choices[0].(map[string]interface{}); ok {
+						if finishReason, ok := choice["finish_reason"].(string); ok && finishReason == "stop" {
+							t.Log("Received finish_reason: stop")
+							goto done
+						}
+					}
+				}
+			}
+		}
+	}
+
+done:
+	// Print summary
+	t.Logf("\n=== Summary ===")
+	t.Logf("Total messages received: %d", len(messages))
+	t.Log("\nAll messages:")
+	for i, msg := range messages {
+		t.Logf("Message %d: %+v", i+1, msg)
+	}
 }

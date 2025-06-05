@@ -136,37 +136,54 @@ func (s *InferenceSession) ProcessInference(ctx context.Context, messages []Mess
 		defer resp.Body.Close()
 		defer stream.Stop()
 
-		scanner := bufio.NewScanner(resp.Body)
-		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024) // 1MB max line size
+		reader := bufio.NewReader(resp.Body)
 
-		for scanner.Scan() {
+		for {
 			select {
 			case <-streamCtx.Done():
+				log.Printf("Stream context cancelled")
 				return
 			default:
-				line := scanner.Text()
-
-				// Skip empty lines
-				if line == "" {
-					continue
+				// Read SSE message (which may span multiple lines)
+				sseMessage, err := s.readSSEMessage(reader)
+				if err != nil {
+					if err == io.EOF {
+						log.Printf("Stream ended (EOF)")
+						return
+					}
+					// Only log non-EOF errors
+					log.Printf("Error reading SSE message: %v", err)
+					if !strings.Contains(err.Error(), "context canceled") {
+						stream.SendResponse(ModelResponse{Error: err})
+					}
+					return
 				}
 
-				// Handle Server-Sent Events (SSE) format
-				if strings.HasPrefix(line, "data: ") {
-					// Remove the "data: " prefix
-					jsonData := strings.TrimPrefix(line, "data: ")
-					jsonData = strings.TrimSpace(jsonData)
+				// Process the SSE message
+				if sseMessage == "" {
+					continue // Empty message, skip
+				}
+
+				// Parse data lines from the SSE message
+				lines := strings.Split(sseMessage, "\n")
+				for _, line := range lines {
+					line = strings.TrimSpace(line)
+					if !strings.HasPrefix(line, "data:") {
+						continue
+					}
+
+					dataContent := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 
 					// Check for end of stream
-					if jsonData == "[DONE]" {
-						log.Printf("Received end of stream signal")
+					if dataContent == "[DONE]" {
+						log.Printf("Received [DONE] signal")
 						return
 					}
 
-					// Parse the JSON response
+					// Parse JSON response
 					var streamResp InferenceEndpointResponse
-					if err := json.Unmarshal([]byte(jsonData), &streamResp); err != nil {
-						log.Printf("Error parsing SSE data: %v, data: %s", err, jsonData)
+					if err := json.Unmarshal([]byte(dataContent), &streamResp); err != nil {
+						log.Printf("Error parsing JSON: %v, data: %s", err, dataContent)
 						continue
 					}
 
@@ -174,17 +191,16 @@ func (s *InferenceSession) ProcessInference(ctx context.Context, messages []Mess
 					if len(streamResp.Choices) > 0 {
 						choice := streamResp.Choices[0]
 
-						// Check for finish reason first
+						// Check for finish reason
 						if choice.FinishReason == "stop" {
 							log.Printf("Received finish_reason: stop")
 							return
 						}
 
-						// Extract content
-						content := choice.Delta.Content
-						if content != "" {
-							// Send the content
-							if !stream.SendResponse(ModelResponse{Content: content}) {
+						// Extract and send content
+						if choice.Delta.Content != "" {
+							if !stream.SendResponse(ModelResponse{Content: choice.Delta.Content}) {
+								log.Printf("Failed to send response, channel might be closed")
 								return
 							}
 						}
@@ -192,17 +208,40 @@ func (s *InferenceSession) ProcessInference(ctx context.Context, messages []Mess
 				}
 			}
 		}
-
-		if err := scanner.Err(); err != nil {
-			log.Printf("Scanner error: %v", err)
-			// Don't send error responses for EOF or canceled context
-			if err != io.EOF && !strings.Contains(err.Error(), "context canceled") {
-				stream.SendResponse(ModelResponse{Error: err})
-			}
-		}
 	}()
 
 	return stream, nil
+}
+
+// readSSEMessage reads a complete SSE message from the reader
+func (s *InferenceSession) readSSEMessage(reader *bufio.Reader) (string, error) {
+	var message strings.Builder
+	hasData := false
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return "", err
+		}
+
+		// Check if this line contains data
+		if strings.HasPrefix(line, "data:") {
+			hasData = true
+		}
+
+		message.WriteString(line)
+
+		// SSE messages are separated by empty lines
+		// An empty line after data indicates end of message
+		if line == "\n" && hasData {
+			return strings.TrimSpace(message.String()), nil
+		}
+
+		// Also handle case where we have two consecutive newlines
+		if strings.HasSuffix(message.String(), "\n\n") && hasData {
+			return strings.TrimSpace(message.String()), nil
+		}
+	}
 }
 
 // Extend prolongs the session lifetime

@@ -268,7 +268,7 @@ func (m *OrchestrationManager) GetOrCreateInferenceSession(ctx context.Context, 
 				continue
 			}
 
-			return &InferenceSession{
+			session := &InferenceSession{
 				ID:           jobID,
 				ModelID:      modelID,
 				Status:       SessionStatusRunning,
@@ -276,7 +276,10 @@ func (m *OrchestrationManager) GetOrCreateInferenceSession(ctx context.Context, 
 				Expiration:   expiration,
 				IsPersistent: false,
 				httpClient:   &http.Client{Timeout: 60 * time.Second},
-			}, nil
+			}
+
+			log.Printf("Reusing existing session %s for model %s at %s", jobID, modelID, endpoint)
+			return session, nil
 		}
 	}
 
@@ -326,7 +329,7 @@ func (m *OrchestrationManager) GetOrCreateInferenceSession(ctx context.Context, 
 					return nil, fmt.Errorf("invalid endpoint URL: %w", err)
 				}
 
-				return &InferenceSession{
+				session := &InferenceSession{
 					ID:           job.ID,
 					ModelID:      modelID,
 					Status:       SessionStatusRunning,
@@ -334,7 +337,10 @@ func (m *OrchestrationManager) GetOrCreateInferenceSession(ctx context.Context, 
 					Expiration:   job.Expiration,
 					IsPersistent: false,
 					httpClient:   &http.Client{Timeout: 60 * time.Second},
-				}, nil
+				}
+
+				log.Printf("Created new session %s for model %s at %s", job.ID, modelID, endpoint)
+				return session, nil
 			}
 		}
 	}
