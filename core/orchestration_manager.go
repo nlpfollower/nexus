@@ -284,13 +284,14 @@ func (m *OrchestrationManager) GetOrCreateInferenceSession(ctx context.Context, 
 	}
 
 	// No existing session, start a new inference job with default config
+	// Use the actual llama-8b checkpoint that exists
 	config := InferenceConfig{
-		DCPDir:           fmt.Sprintf("/mnt/cold/contents/dcp/%s/step-0", modelID),
+		DCPDir:           "/mnt/cold/contents/dcp/llama-8b/step-0",
 		TokenizerPath:    "/mnt/cold/contents/checkpoints/Llama3.1-8B-Instruct/tokenizer.model",
 		ParamsPath:       "torchchat/model_params/Meta-Llama-3.1-8B.json",
 		Port:             5000,
 		DCPModelSize:     "8B",
-		CheckpointFolder: modelID,
+		CheckpointFolder: "llama-8b",
 		NodeCount:        1,
 		RaidMountPath:    "/mnt/cold",
 		RaidName:         "cold-new",
