@@ -6,7 +6,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"github.com/nlpfollower/deltamind/database/db"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -732,4 +735,259 @@ done:
 	for i, msg := range messages {
 		t.Logf("Message %d: %+v", i+1, msg)
 	}
+}
+
+func TestNexusE2E_SessionAndInference(t *testing.T) {
+	if os.Getenv("RUN_E2E_TEST") != "true" {
+		t.Skip("Skipping E2E test. Set RUN_E2E_TEST=true to run.")
+	}
+
+	// Get an available port for nexus
+	listener, err := net.Listen("tcp", ":0")
+	require.NoError(t, err)
+	port := listener.Addr().(*net.TCPAddr).Port
+	listener.Close()
+
+	cfg := &Config{
+		Port: port,
+	}
+
+	// Start nexus
+	nexus, err := NewNexus(cfg)
+	require.NoError(t, err)
+
+	err = nexus.Start()
+	require.NoError(t, err)
+	defer nexus.Stop()
+
+	t.Logf("Nexus started on port %d", port)
+
+	// Connect to nexus
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	require.NoError(t, err)
+	defer conn.Close()
+
+	encoder := json.NewEncoder(conn)
+	decoder := json.NewDecoder(conn)
+
+	// Step 1: Send SESSION request to start inference server
+	t.Log("Step 1: Starting inference session...")
+
+	modelID := db.NewDigest([]byte("llama-8b"))
+	sessionReqID := db.NewDigest([]byte("session-request-1"))
+
+	sessionReq := &SessionRequest{
+		Action:  SessionActionStart,
+		ModelID: modelID,
+	}
+
+	wrappedSessionReq, err := NewWrappedRequest(sessionReqID, sessionReq)
+	require.NoError(t, err)
+
+	err = encoder.Encode(wrappedSessionReq)
+	require.NoError(t, err)
+
+	// Wait for session response (this could take up to 3 minutes)
+	var sessionResp WrappedResponse
+	err = decoder.Decode(&sessionResp)
+	require.NoError(t, err)
+	require.Equal(t, sessionReqID, sessionResp.RequestID)
+
+	var sessionResponse SessionResponse
+	err = json.Unmarshal(sessionResp.Data, &sessionResponse)
+	require.NoError(t, err)
+	require.Equal(t, ResponseStatusSuccess, sessionResponse.Status)
+	require.NotEmpty(t, sessionResponse.SessionID)
+	require.NotEmpty(t, sessionResponse.Endpoint)
+
+	t.Logf("Session started successfully: ID=%s, Endpoint=%s", sessionResponse.SessionID, sessionResponse.Endpoint)
+
+	// Give the server a moment to stabilize
+	time.Sleep(2 * time.Second)
+
+	// Step 2: Send INFERENCE request
+	t.Log("Step 2: Sending inference request...")
+
+	inferReqID := db.NewDigest([]byte("inference-request-1"))
+	userID := db.NewDigest([]byte("test-user"))
+
+	inferReq := &InferenceRequest{
+		UserID:  userID,
+		ModelID: modelID,
+		Messages: []Message{
+			{Role: "user", Content: "Count to 3 and say hello"},
+		},
+	}
+
+	wrappedInferReq, err := NewWrappedRequest(inferReqID, inferReq)
+	require.NoError(t, err)
+
+	err = encoder.Encode(wrappedInferReq)
+	require.NoError(t, err)
+
+	// Step 3: Collect streaming responses
+	t.Log("Step 3: Collecting streaming responses...")
+
+	var responses []InferenceResponse
+	var fullContent strings.Builder
+	done := make(chan struct{})
+	streamErr := make(chan error, 1)
+
+	go func() {
+		defer close(done)
+
+		for {
+			var resp WrappedResponse
+			if err := decoder.Decode(&resp); err != nil {
+				if !strings.Contains(err.Error(), "use of closed network connection") {
+					streamErr <- fmt.Errorf("decode error: %w", err)
+				}
+				return
+			}
+
+			// Verify it's for our request
+			if resp.RequestID != inferReqID {
+				continue
+			}
+
+			var inferResp InferenceResponse
+			if err := json.Unmarshal(resp.Data, &inferResp); err != nil {
+				streamErr <- fmt.Errorf("unmarshal error: %w", err)
+				return
+			}
+
+			responses = append(responses, inferResp)
+			fullContent.WriteString(inferResp.Content)
+
+			t.Logf("Response %d: Type=%s, Status=%s, Content=%q",
+				len(responses), inferResp.Type, inferResp.Status, inferResp.Content)
+
+			// Check if this is the final response
+			if inferResp.Type == ResponseTypeFinal {
+				t.Log("Received final response")
+				return
+			}
+
+			// Check for errors
+			if inferResp.Status == ResponseStatusError {
+				streamErr <- fmt.Errorf("inference error: %s", inferResp.Content)
+				return
+			}
+		}
+	}()
+
+	// Wait for streaming to complete
+	select {
+	case <-done:
+		t.Log("Streaming completed successfully")
+	case err := <-streamErr:
+		t.Fatalf("Streaming error: %v", err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("Timeout waiting for streaming responses")
+	}
+
+	// Verify results
+	t.Logf("\n=== Results ===")
+	t.Logf("Total responses: %d", len(responses))
+	t.Logf("Full content: %q", fullContent.String())
+
+	require.Greater(t, len(responses), 0, "Should have received at least one response")
+	require.NotEmpty(t, fullContent.String(), "Should have received content")
+
+	// Verify we got both partial and final responses
+	hasPartial := false
+	hasFinal := false
+	for _, resp := range responses {
+		if resp.Type == ResponseTypePartial {
+			hasPartial = true
+		}
+		if resp.Type == ResponseTypeFinal {
+			hasFinal = true
+		}
+	}
+	require.True(t, hasPartial, "Should have received partial responses")
+	require.True(t, hasFinal, "Should have received final response")
+
+	// Step 4: Send another inference request to test session reuse
+	t.Log("\nStep 4: Testing session reuse with second inference...")
+
+	inferReqID2 := db.NewDigest([]byte("inference-request-2"))
+	inferReq2 := &InferenceRequest{
+		UserID:  userID,
+		ModelID: modelID,
+		Messages: []Message{
+			{Role: "user", Content: "What is 2+2?"},
+		},
+	}
+
+	wrappedInferReq2, err := NewWrappedRequest(inferReqID2, inferReq2)
+	require.NoError(t, err)
+
+	err = encoder.Encode(wrappedInferReq2)
+	require.NoError(t, err)
+
+	// Collect second response
+	done2 := make(chan struct{})
+	var secondResponse strings.Builder
+
+	go func() {
+		defer close(done2)
+
+		for {
+			var resp WrappedResponse
+			if err := decoder.Decode(&resp); err != nil {
+				return
+			}
+
+			if resp.RequestID != inferReqID2 {
+				continue
+			}
+
+			var inferResp InferenceResponse
+			json.Unmarshal(resp.Data, &inferResp)
+			secondResponse.WriteString(inferResp.Content)
+
+			if inferResp.Type == ResponseTypeFinal {
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-done2:
+		t.Logf("Second inference completed: %q", secondResponse.String())
+	case <-time.After(15 * time.Second):
+		t.Fatal("Timeout on second inference")
+	}
+
+	require.Contains(t, secondResponse.String(), "4", "Response should contain '4'")
+
+	// Step 5: Stop the session
+	t.Log("\nStep 5: Stopping the session...")
+
+	sessionStopReqID := db.NewDigest([]byte("session-stop-request"))
+	sessionStopReq := &SessionRequest{
+		Action:    SessionActionStop,
+		SessionID: sessionResponse.SessionID,
+	}
+
+	wrappedStopReq, err := NewWrappedRequest(sessionStopReqID, sessionStopReq)
+	require.NoError(t, err)
+
+	err = encoder.Encode(wrappedStopReq)
+	require.NoError(t, err)
+
+	// Wait for stop response
+	var stopResp WrappedResponse
+	err = decoder.Decode(&stopResp)
+	require.NoError(t, err)
+	require.Equal(t, sessionStopReqID, stopResp.RequestID)
+
+	var stopResponse SessionResponse
+	err = json.Unmarshal(stopResp.Data, &stopResponse)
+	require.NoError(t, err)
+	require.Equal(t, ResponseStatusSuccess, stopResponse.Status)
+
+	t.Log("Session stopped successfully")
+	t.Log("\n✅ End-to-end test completed successfully!")
 }
