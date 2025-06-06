@@ -89,7 +89,7 @@ type WrappedResponse struct {
 // Request implementations
 type InferenceRequest struct {
 	UserID   db.Digest `json:"user_id"`
-	ModelID  db.Digest `json:"model_id"`
+	ModelID  string    `json:"model_id"`
 	Messages []Message `json:"messages"`
 }
 

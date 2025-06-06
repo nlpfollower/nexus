@@ -201,8 +201,11 @@ func (n *Nexus) handleInference(req *Request) error {
 		return fmt.Errorf("invalid inference request data")
 	}
 
+	// Convert string to digest for API model check
+	modelDigest := db.NewDigest([]byte(inferReq.ModelID))
+
 	// Check if this is an API model
-	if n.apiManager.IsAPIModel(inferReq.ModelID) {
+	if n.apiManager.IsAPIModel(modelDigest) {
 		return n.handleAPIInference(req)
 	}
 
@@ -210,7 +213,7 @@ func (n *Nexus) handleInference(req *Request) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	session, err := n.orchestrationMgr.GetOrCreateInferenceSession(ctx, inferReq.ModelID.String())
+	session, err := n.orchestrationMgr.GetOrCreateInferenceSession(ctx, inferReq.ModelID)
 	if err != nil {
 		return fmt.Errorf("failed to get/create inference session: %w", err)
 	}
@@ -404,7 +407,8 @@ func (n *Nexus) handleAPIInference(req *Request) error {
 		return fmt.Errorf("invalid inference request data")
 	}
 
-	model, err := n.apiManager.GetAPIModel(inferReq.ModelID)
+	modelDigest := db.NewDigest([]byte(inferReq.ModelID))
+	model, err := n.apiManager.GetAPIModel(modelDigest)
 	if err != nil {
 		return fmt.Errorf("failed to get API model: %w", err)
 	}

@@ -71,14 +71,12 @@ func TestNexus(t *testing.T) {
 
 		// Setup request
 		userID := db.NewDigest([]byte("test-user"))
-		modelID := APIModelToDigest(APIModelIDGPT4)
 		reqID := db.NewDigest([]byte("test-request"))
 
 		inferReq := &InferenceRequest{
 			UserID:  userID,
-			ModelID: modelID,
+			ModelID: "gpt-4", // or "llama-8b"
 			Messages: []Message{
-				{Role: "system", Content: "You are a helpful assistant. Keep responses very short."},
 				{Role: "user", Content: "What is 2+2?"},
 			},
 		}
@@ -210,7 +208,7 @@ func TestNexus(t *testing.T) {
 
 		inferReq := &InferenceRequest{
 			UserID:   db.NewDigest([]byte("test-user")),
-			ModelID:  db.NewDigest([]byte("invalid-model")),
+			ModelID:  "invalid-model",
 			Messages: []Message{{Role: "user", Content: "test"}},
 		}
 
@@ -267,12 +265,11 @@ func TestGenerationCancellation(t *testing.T) {
 
 		// Send inference request
 		userID := db.NewDigest([]byte("test-user"))
-		modelID := APIModelToDigest(APIModelIDGPT4)
 		reqID := db.NewDigest([]byte("test-request"))
 
 		inferReq := &InferenceRequest{
 			UserID:  userID,
-			ModelID: modelID,
+			ModelID: "gpt-4",
 			Messages: []Message{
 				{Role: "user", Content: "Write a short story about a dog"},
 			},
@@ -320,7 +317,7 @@ func TestGenerationCancellation(t *testing.T) {
 			reqIDs[i] = db.NewDigest([]byte(fmt.Sprintf("test-request-%d", i)))
 			inferReq := &InferenceRequest{
 				UserID:  db.NewDigest([]byte("test-user")),
-				ModelID: APIModelToDigest(APIModelIDGPT4),
+				ModelID: "gpt-4",
 				Messages: []Message{
 					{Role: "user", Content: "Write a short story about a cat"},
 				},
@@ -375,7 +372,7 @@ func TestGenerationCancellation(t *testing.T) {
 		reqID1 := db.NewDigest([]byte("test-request-1"))
 		inferReq := &InferenceRequest{
 			UserID:  db.NewDigest([]byte("test-user")),
-			ModelID: APIModelToDigest(APIModelIDGPT4),
+			ModelID: "gpt-4",
 			Messages: []Message{
 				{Role: "user", Content: "Write a short story about a cat"},
 			},
