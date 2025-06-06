@@ -134,7 +134,7 @@ const (
 
 type SessionRequest struct {
 	Action    SessionAction `json:"action"`
-	ModelID   db.Digest     `json:"model_id,omitempty"`   // Required for START
+	ModelID   string        `json:"model_id,omitempty"`   // Required for START
 	SessionID string        `json:"session_id,omitempty"` // Required for STOP and EXTEND
 	Duration  string        `json:"duration,omitempty"`   // Optional for EXTEND, format like "30m"
 }

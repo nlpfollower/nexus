@@ -265,18 +265,18 @@ func (n *Nexus) handleSessionRequest(req *Request) error {
 	case SessionActionStart:
 		// Start a new inference job
 		config := InferenceConfig{
-			DCPDir:           fmt.Sprintf("/mnt/cold/contents/dcp/%s/step-0", sessionReq.ModelID.String()),
+			DCPDir:           fmt.Sprintf("/mnt/cold/contents/dcp/%s/step-0", sessionReq.ModelID),
 			TokenizerPath:    "/mnt/cold/contents/checkpoints/Llama3.1-8B-Instruct/tokenizer.model",
 			ParamsPath:       "torchchat/model_params/Meta-Llama-3.1-8B.json",
 			Port:             5000,
 			DCPModelSize:     "8B",
-			CheckpointFolder: sessionReq.ModelID.String(),
+			CheckpointFolder: sessionReq.ModelID,
 			NodeCount:        1,
 			RaidMountPath:    "/mnt/cold",
 			RaidName:         "cold-new",
 		}
 
-		job, err := n.orchestrationMgr.StartInferenceJob(ctx, sessionReq.ModelID.String(), config)
+		job, err := n.orchestrationMgr.StartInferenceJob(ctx, sessionReq.ModelID, config)
 		if err != nil {
 			return fmt.Errorf("failed to start inference job: %w", err)
 		}

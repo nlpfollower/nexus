@@ -774,7 +774,7 @@ func TestNexusE2E_SessionAndInference(t *testing.T) {
 	t.Log("Step 1: Starting inference session...")
 
 	// Use the actual model name that has a checkpoint
-	modelID := db.NewDigest([]byte("llama-8b"))
+	modelID := "llama-8b"
 	sessionReqID := db.NewDigest([]byte("session-request-1"))
 
 	sessionReq := &SessionRequest{
