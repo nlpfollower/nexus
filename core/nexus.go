@@ -282,7 +282,7 @@ func (n *Nexus) handleSessionRequest(req *Request) error {
 		}
 
 		// Wait for job to be ready
-		readyCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+		readyCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 		defer cancel()
 
 		ticker := time.NewTicker(5 * time.Second)
