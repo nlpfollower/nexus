@@ -194,7 +194,6 @@ func (n *Nexus) processRequest(req *Request) error {
 	}
 }
 
-// handleInference processes an inference request
 func (n *Nexus) handleInference(req *Request) error {
 	inferReq, ok := req.Data.(*InferenceRequest)
 	if !ok {
@@ -210,16 +209,18 @@ func (n *Nexus) handleInference(req *Request) error {
 	}
 
 	// Get or create an inference session for this model
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
+	// Use a separate context for session creation
+	sessionCtx, sessionCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer sessionCancel()
 
-	session, err := n.orchestrationMgr.GetOrCreateInferenceSession(ctx, inferReq.ModelID)
+	session, err := n.orchestrationMgr.GetOrCreateInferenceSession(sessionCtx, inferReq.ModelID)
 	if err != nil {
 		return fmt.Errorf("failed to get/create inference session: %w", err)
 	}
 
-	// Process the inference request
-	stream, err := session.ProcessInference(ctx, inferReq.Messages)
+	// Process the inference request with a fresh context
+	inferenceCtx := context.Background() // Don't use a timeout for streaming
+	stream, err := session.ProcessInference(inferenceCtx, inferReq.Messages)
 	if err != nil {
 		return fmt.Errorf("failed to process inference: %w", err)
 	}
