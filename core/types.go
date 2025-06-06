@@ -130,12 +130,13 @@ const (
 	SessionActionStart  SessionAction = "START"
 	SessionActionStop   SessionAction = "STOP"
 	SessionActionExtend SessionAction = "EXTEND"
+	SessionActionStatus SessionAction = "STATUS" // New action for checking status
 )
 
 type SessionRequest struct {
 	Action    SessionAction `json:"action"`
 	ModelID   string        `json:"model_id,omitempty"`   // Required for START
-	SessionID string        `json:"session_id,omitempty"` // Required for STOP and EXTEND
+	SessionID string        `json:"session_id,omitempty"` // Required for STOP, EXTEND, and STATUS
 	Duration  string        `json:"duration,omitempty"`   // Optional for EXTEND, format like "30m"
 }
 
@@ -147,6 +148,7 @@ type SessionResponse struct {
 	Status    ResponseStatus `json:"status"`
 	SessionID string         `json:"session_id,omitempty"`
 	Endpoint  string         `json:"endpoint,omitempty"`
+	State     string         `json:"state,omitempty"` // New field to indicate session state
 	Error     string         `json:"error,omitempty"`
 }
 

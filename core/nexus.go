@@ -285,34 +285,12 @@ func (n *Nexus) handleSessionRequest(req *Request) error {
 			return fmt.Errorf("failed to start inference job: %w", err)
 		}
 
-		// Wait for job to be ready
-		readyCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
-		defer cancel()
-
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-readyCtx.Done():
-				return fmt.Errorf("timeout waiting for inference job to start")
-			case <-ticker.C:
-				job.mu.RLock()
-				status := job.Status
-				endpoint := job.Endpoint
-				job.mu.RUnlock()
-
-				if status == JobStatusRunning && endpoint != "" {
-					response = SessionResponse{
-						Status:    ResponseStatusSuccess,
-						SessionID: job.ID,
-						Endpoint:  endpoint,
-					}
-					goto sendResponse
-				} else if status == JobStatusError {
-					return fmt.Errorf("inference job failed to start")
-				}
-			}
+		// Return immediately with the job ID and initializing status
+		// Client can poll using JobStatus to check when it's ready
+		response = SessionResponse{
+			Status:    ResponseStatusSuccess,
+			SessionID: job.ID,
+			State:     string(JobStatusInitializing), // Add state field to indicate it's still starting
 		}
 
 	case SessionActionStop:
@@ -360,19 +338,43 @@ func (n *Nexus) handleSessionRequest(req *Request) error {
 
 		job.mu.RLock()
 		endpoint := job.Endpoint
+		status := job.Status
 		job.mu.RUnlock()
 
 		response = SessionResponse{
 			Status:    ResponseStatusSuccess,
 			SessionID: job.ID,
 			Endpoint:  endpoint,
+			State:     string(status),
+		}
+
+	case SessionActionStatus:
+		// New action to check session status
+		if sessionReq.SessionID == "" {
+			return fmt.Errorf("session_id is required for checking status")
+		}
+
+		job, ok := n.orchestrationMgr.GetJob(sessionReq.SessionID)
+		if !ok {
+			return fmt.Errorf("session not found: %s", sessionReq.SessionID)
+		}
+
+		job.mu.RLock()
+		endpoint := job.Endpoint
+		status := job.Status
+		job.mu.RUnlock()
+
+		response = SessionResponse{
+			Status:    ResponseStatusSuccess,
+			SessionID: job.ID,
+			Endpoint:  endpoint,
+			State:     string(status),
 		}
 
 	default:
 		return fmt.Errorf("unknown session action: %s", sessionReq.Action)
 	}
 
-sendResponse:
 	// Send the response
 	n.sendWrappedResponse(req, &response)
 	return nil

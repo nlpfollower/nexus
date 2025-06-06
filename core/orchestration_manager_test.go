@@ -788,7 +788,7 @@ func TestNexusE2E_SessionAndInference(t *testing.T) {
 	err = encoder.Encode(wrappedSessionReq)
 	require.NoError(t, err)
 
-	// Wait for session response (this could take up to 3 minutes)
+	// Wait for session response (should return immediately now)
 	var sessionResp WrappedResponse
 	err = decoder.Decode(&sessionResp)
 	require.NoError(t, err)
@@ -799,9 +799,62 @@ func TestNexusE2E_SessionAndInference(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, ResponseStatusSuccess, sessionResponse.Status)
 	require.NotEmpty(t, sessionResponse.SessionID)
-	require.NotEmpty(t, sessionResponse.Endpoint)
 
-	t.Logf("Session started successfully: ID=%s, Endpoint=%s", sessionResponse.SessionID, sessionResponse.Endpoint)
+	sessionID := sessionResponse.SessionID
+	t.Logf("Session %s started (state: %s)", sessionID, sessionResponse.State)
+
+	// Step 1b: Poll for session readiness
+	t.Log("Step 1b: Waiting for session to be ready...")
+
+	var sessionEndpoint string
+	deadline := time.Now().Add(10 * time.Minute)
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	pollCount := 0
+	for time.Now().Before(deadline) {
+		pollCount++
+
+		// Send status check request
+		statusReqID := db.NewDigest([]byte(fmt.Sprintf("session-status-%d", pollCount)))
+		statusReq := &SessionRequest{
+			Action:    SessionActionStatus,
+			SessionID: sessionID,
+		}
+
+		wrappedStatusReq, err := NewWrappedRequest(statusReqID, statusReq)
+		require.NoError(t, err)
+
+		err = encoder.Encode(wrappedStatusReq)
+		require.NoError(t, err)
+
+		// Read status response
+		var statusResp WrappedResponse
+		err = decoder.Decode(&statusResp)
+		require.NoError(t, err)
+		require.Equal(t, statusReqID, statusResp.RequestID)
+
+		var statusResponse SessionResponse
+		err = json.Unmarshal(statusResp.Data, &statusResponse)
+		require.NoError(t, err)
+
+		t.Logf("Poll %d: Session state = %s", pollCount, statusResponse.State)
+
+		// Check if session is ready
+		if statusResponse.State == string(JobStatusRunning) && statusResponse.Endpoint != "" {
+			sessionEndpoint = statusResponse.Endpoint
+			t.Logf("Session ready after %d polls! Endpoint: %s", pollCount, sessionEndpoint)
+			break
+		}
+
+		if statusResponse.State == string(JobStatusError) {
+			t.Fatalf("Session failed to start after %d polls", pollCount)
+		}
+
+		<-ticker.C
+	}
+
+	require.NotEmpty(t, sessionEndpoint, "Session should have an endpoint after initialization")
 
 	// Give the server a moment to stabilize
 	time.Sleep(2 * time.Second)
@@ -969,7 +1022,7 @@ func TestNexusE2E_SessionAndInference(t *testing.T) {
 	sessionStopReqID := db.NewDigest([]byte("session-stop-request"))
 	sessionStopReq := &SessionRequest{
 		Action:    SessionActionStop,
-		SessionID: sessionResponse.SessionID,
+		SessionID: sessionID,
 	}
 
 	wrappedStopReq, err := NewWrappedRequest(sessionStopReqID, sessionStopReq)
