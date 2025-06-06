@@ -302,22 +302,26 @@ func (m *OrchestrationManager) GetOrCreateInferenceSession(ctx context.Context, 
 	}
 
 	// Wait for the job to be ready
-	readyCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	readyCtx, cancel := context.WithTimeout(ctx, 6*time.Minute)
 	defer cancel()
 
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
+	checkCount := 0
 	for {
 		select {
 		case <-readyCtx.Done():
-			return nil, fmt.Errorf("timeout waiting for inference job to be ready")
+			return nil, fmt.Errorf("timeout waiting for inference job to be ready after %d checks", checkCount)
 		case <-ticker.C:
+			checkCount++
 			job.mu.RLock()
 			status := job.Status
 			endpoint := job.Endpoint
 			lastError := job.LastError
 			job.mu.RUnlock()
+
+			log.Printf("GetOrCreateSession check %d: status=%s, endpoint=%s", checkCount, status, endpoint)
 
 			if status == JobStatusError {
 				return nil, fmt.Errorf("inference job failed: %w", lastError)
@@ -339,7 +343,7 @@ func (m *OrchestrationManager) GetOrCreateInferenceSession(ctx context.Context, 
 					httpClient:   &http.Client{Timeout: 60 * time.Second},
 				}
 
-				log.Printf("Created new session %s for model %s at %s", job.ID, modelID, endpoint)
+				log.Printf("Created new session %s for model %s at %s after %d checks", job.ID, modelID, endpoint, checkCount)
 				return session, nil
 			}
 		}
