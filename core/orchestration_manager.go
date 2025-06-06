@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -353,9 +354,26 @@ func (m *OrchestrationManager) GetOrCreateInferenceSession(ctx context.Context, 
 
 // executeOrchestrationCommand runs a command in the orchestration directory
 func (m *OrchestrationManager) executeOrchestrationCommand(ctx context.Context, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "go", append([]string{"run", "main.go"}, args...)...)
+	fullArgs := append([]string{"run", "main.go"}, args...)
+	cmd := exec.CommandContext(ctx, "go", fullArgs...)
 	cmd.Dir = m.orchestrationDir
-	return cmd.CombinedOutput()
+
+	// Log the full command
+	log.Printf("Executing command in %s: go %s", m.orchestrationDir, strings.Join(fullArgs, " "))
+
+	// Capture both stdout and stderr
+	output, err := cmd.CombinedOutput()
+
+	// Always log the output, even on success
+	if len(output) > 0 {
+		log.Printf("Command output:\n%s", string(output))
+	}
+
+	if err != nil {
+		log.Printf("Command failed with error: %v", err)
+	}
+
+	return output, err
 }
 
 func (m *OrchestrationManager) startInferenceProcess(ctx context.Context, job *OrchestrationJob, config InferenceConfig) error {
@@ -385,6 +403,17 @@ func (m *OrchestrationManager) startInferenceProcess(ctx context.Context, job *O
 		args = append(args, "--raid-name", config.RaidName)
 	}
 
+	// Log the config being used
+	log.Printf("Starting inference with config:")
+	log.Printf("  DCPDir: %s", config.DCPDir)
+	log.Printf("  TokenizerPath: %s", config.TokenizerPath)
+	log.Printf("  ParamsPath: %s", config.ParamsPath)
+	log.Printf("  Port: %d", config.Port)
+	log.Printf("  DCPModelSize: %s", config.DCPModelSize)
+	log.Printf("  CheckpointFolder: %s", config.CheckpointFolder)
+	log.Printf("  RaidMountPath: %s", config.RaidMountPath)
+	log.Printf("  RaidName: %s", config.RaidName)
+
 	// Execute the command
 	output, err := m.executeOrchestrationCommand(ctx, args...)
 	if err != nil {
@@ -395,8 +424,8 @@ func (m *OrchestrationManager) startInferenceProcess(ctx context.Context, job *O
 		return job.LastError
 	}
 
-	// Wait for server to be ready with up to 3 minute timeout
-	readyCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	// Wait for server to be ready with up to 6 minute timeout
+	readyCtx, cancel := context.WithTimeout(ctx, 6*time.Minute)
 	defer cancel()
 
 	log.Printf("Waiting for inference server to be ready (job %s)...", job.ID)
@@ -404,18 +433,23 @@ func (m *OrchestrationManager) startInferenceProcess(ctx context.Context, job *O
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
+	checkCount := 0
 	for {
 		select {
 		case <-readyCtx.Done():
 			job.mu.Lock()
 			job.Status = JobStatusError
-			job.LastError = fmt.Errorf("timeout waiting for inference server to be ready")
+			job.LastError = fmt.Errorf("timeout waiting for inference server to be ready after %d checks", checkCount)
 			job.mu.Unlock()
 			return job.LastError
 
 		case <-ticker.C:
+			checkCount++
 			status, err := m.checkInferenceStatus(ctx)
-			if err == nil {
+			if err != nil {
+				log.Printf("Check %d: Error checking inference status: %v", checkCount, err)
+			} else {
+				log.Printf("Check %d: Inference status: %+v", checkCount, status)
 				if serverStatus, ok := status["status"].(string); ok && serverStatus == "healthy" {
 					// Server is ready
 					job.mu.Lock()
@@ -425,7 +459,7 @@ func (m *OrchestrationManager) startInferenceProcess(ctx context.Context, job *O
 					}
 					job.mu.Unlock()
 
-					log.Printf("Inference job %s started successfully", job.ID)
+					log.Printf("Inference job %s started successfully after %d checks", job.ID, checkCount)
 					return nil
 				}
 			}
@@ -506,22 +540,27 @@ func (m *OrchestrationManager) checkInferenceStatus(ctx context.Context) (map[st
 		"--skip-cluster-creation", "--silent-mode",
 	}
 
+	log.Printf("Checking inference status...")
 	output, err := m.executeOrchestrationCommand(ctx, args...)
 	if err != nil {
 		// Status command might return non-zero exit code even with valid JSON output
 		// Try to parse the output anyway
 		var status map[string]interface{}
 		if jsonErr := json.Unmarshal(output, &status); jsonErr == nil {
+			log.Printf("Status check returned (with error): %+v", status)
 			return status, nil
 		}
+		log.Printf("Status check failed: %v, output: %s", err, string(output))
 		return nil, fmt.Errorf("failed to get inference status: %w", err)
 	}
 
 	var status map[string]interface{}
 	if err := json.Unmarshal(output, &status); err != nil {
+		log.Printf("Failed to parse status JSON: %v, output: %s", err, string(output))
 		return nil, fmt.Errorf("failed to parse status output: %w", err)
 	}
 
+	log.Printf("Status check returned: %+v", status)
 	return status, nil
 }
 
