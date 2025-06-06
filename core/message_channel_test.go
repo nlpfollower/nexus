@@ -15,11 +15,10 @@ func TestMessageChannel(t *testing.T) {
 		// Create test request
 		reqID := db.NewDigest([]byte("test-request"))
 		connID := "test-connection"
-		modelId := APIModelToDigest(APIModelIDGPT4)
 
 		req, err := NewWrappedRequest[*InferenceRequest](reqID, &InferenceRequest{
 			UserID:   db.NewDigest([]byte("123")),
-			ModelID:  modelId,
+			ModelID:  "gpt-4",
 			Messages: []Message{},
 		})
 		require.NoError(t, err)
@@ -82,7 +81,7 @@ func TestMessageChannel(t *testing.T) {
 			reqID := db.NewDigest([]byte(fmt.Sprintf("test-request-%d", i)))
 			req, err := NewWrappedRequest[*InferenceRequest](reqID, &InferenceRequest{
 				UserID:   db.NewDigest([]byte(fmt.Sprintf("user-%d", i))),
-				ModelID:  APIModelToDigest(APIModelIDGPT4),
+				ModelID:  "gpt-4",
 				Messages: []Message{},
 			})
 			require.NoError(t, err)
@@ -94,7 +93,7 @@ func TestMessageChannel(t *testing.T) {
 		reqID := db.NewDigest([]byte("overflow-request"))
 		req, err := NewWrappedRequest[*InferenceRequest](reqID, &InferenceRequest{
 			UserID:   db.NewDigest([]byte("overflow-user")),
-			ModelID:  APIModelToDigest(APIModelIDGPT4),
+			ModelID:  "gpt-4",
 			Messages: []Message{},
 		})
 		require.NoError(t, err)
@@ -110,7 +109,7 @@ func TestMessageChannel(t *testing.T) {
 		reqID := db.NewDigest([]byte("test-request"))
 		req, err := NewWrappedRequest[*InferenceRequest](reqID, &InferenceRequest{
 			UserID:   db.NewDigest([]byte("test-user")),
-			ModelID:  APIModelToDigest(APIModelIDGPT4),
+			ModelID:  "gpt-4",
 			Messages: []Message{},
 		})
 		require.NoError(t, err)

@@ -43,7 +43,7 @@ func TestConnectionManager(t *testing.T) {
 		requestID := db.NewDigest([]byte("test-request"))
 		inferReq := &InferenceRequest{
 			UserID:   db.NewDigest([]byte("123")),
-			ModelID:  APIModelToDigest(APIModelIDGPT4),
+			ModelID:  "gpt-4",
 			Messages: []Message{},
 		}
 
@@ -103,7 +103,7 @@ func TestConnectionManager(t *testing.T) {
 
 			inferReq := &InferenceRequest{
 				UserID:   db.NewDigest([]byte("123")),
-				ModelID:  APIModelToDigest(APIModelIDGPT4),
+				ModelID:  "gpt-4",
 				Messages: []Message{},
 			}
 
@@ -161,7 +161,7 @@ func TestConnectionManager(t *testing.T) {
 		requestID := db.NewDigest([]byte("test-close"))
 		inferReq := &InferenceRequest{
 			UserID:   db.NewDigest([]byte("test-user")),
-			ModelID:  APIModelToDigest(APIModelIDGPT4),
+			ModelID:  "gpt-4",
 			Messages: []Message{},
 		}
 
@@ -208,7 +208,7 @@ func TestConnectionManager(t *testing.T) {
 			requestID := db.NewDigest([]byte(fmt.Sprintf("test-shutdown-%d", i)))
 			inferReq := &InferenceRequest{
 				UserID:   db.NewDigest([]byte("test-user")),
-				ModelID:  APIModelToDigest(APIModelIDGPT4),
+				ModelID:  "gpt-4",
 				Messages: []Message{},
 			}
 			request, err := NewWrappedRequest[*InferenceRequest](requestID, inferReq)
