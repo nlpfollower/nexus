@@ -30,9 +30,10 @@ type InferenceSession struct {
 
 // InferenceEndpointRequest represents the request body sent to inference endpoints
 type InferenceEndpointRequest struct {
-	Stream   bool      `json:"stream"`
-	Model    string    `json:"model"`
-	Messages []Message `json:"messages"`
+	Stream    bool      `json:"stream"`
+	Model     string    `json:"model"`
+	Messages  []Message `json:"messages"`
+	MaxTokens int       `json:"max_tokens"`
 }
 
 // InferenceEndpointResponse represents a streaming response from the endpoint
@@ -84,9 +85,10 @@ func (s *InferenceSession) ProcessInference(ctx context.Context, messages []Mess
 
 	// Create the request body
 	reqBody := InferenceEndpointRequest{
-		Stream:   true,
-		Model:    "", // Keep model field empty as required by the inference server
-		Messages: messages,
+		Stream:    true,
+		Model:     "", // Keep model field empty as required by the inference server
+		Messages:  messages,
+		MaxTokens: 300,
 	}
 
 	// Serialize request body
