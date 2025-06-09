@@ -96,20 +96,31 @@ func (m *OrchestrationManager) Start() {
 // Stop gracefully shuts down the orchestration manager
 func (m *OrchestrationManager) Stop() {
 	m.closeOnce.Do(func() {
+		log.Println("Orchestration manager stopping...")
 		close(m.done)
 
-		// Stop all running jobs
-		for _, job := range m.jobs.GetAll() {
-			job.mu.RLock()
-			isRunning := job.Status == JobStatusRunning || job.Status == JobStatusInitializing
-			job.mu.RUnlock()
+		// Stop all running jobs with proper cleanup
+		runningJobs := m.GetRunningJobs()
+		if len(runningJobs) > 0 {
+			log.Printf("Stopping %d running jobs for clean shutdown", len(runningJobs))
 
-			if isRunning {
-				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-				if err := m.stopJob(ctx, job); err != nil {
-					log.Printf("Error stopping job %s: %v", job.ID, err)
+			for _, job := range runningJobs {
+				job.mu.RLock()
+				jobID := job.ID
+				jobType := job.Type
+				status := job.Status
+				job.mu.RUnlock()
+
+				if status == JobStatusRunning || status == JobStatusInitializing {
+					log.Printf("Stopping %s job %s", jobType, jobID)
+					ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+					if err := m.stopJob(ctx, job); err != nil {
+						log.Printf("Error stopping job %s: %v", jobID, err)
+					} else {
+						log.Printf("Successfully stopped job %s", jobID)
+					}
+					cancel()
 				}
-				cancel()
 			}
 		}
 
@@ -192,6 +203,84 @@ func (m *OrchestrationManager) StopJob(ctx context.Context, jobID string) error 
 	}
 
 	return m.stopJob(ctx, job)
+}
+
+func (m *OrchestrationManager) stopJob(ctx context.Context, job *OrchestrationJob) error {
+	job.mu.Lock()
+	currentStatus := job.Status
+	jobType := job.Type
+	jobID := job.ID
+	job.mu.Unlock()
+
+	// Don't stop if already stopped or stopping
+	if currentStatus == JobStatusStopped {
+		log.Printf("Job %s already stopped", jobID)
+		return nil
+	}
+
+	if currentStatus == JobStatusError {
+		log.Printf("Job %s already in error state", jobID)
+		return nil
+	}
+
+	log.Printf("Stopping %s job %s (current status: %s)", jobType, jobID, currentStatus)
+
+	var err error
+	switch jobType {
+	case JobTypeInference:
+		err = m.stopInferenceProcess(ctx, job)
+	case JobTypeTraining:
+		// TODO: Implement training stop logic
+		err = fmt.Errorf("stopping training jobs not yet implemented")
+	}
+
+	// Update final status
+	job.mu.Lock()
+	now := time.Now()
+	job.StoppedAt = &now
+	if err != nil {
+		job.Status = JobStatusError
+		job.LastError = err
+		log.Printf("Job %s stopped with error: %v", jobID, err)
+	} else {
+		job.Status = JobStatusStopped
+		log.Printf("Job %s stopped successfully", jobID)
+	}
+	job.mu.Unlock()
+
+	return err
+}
+
+func (m *OrchestrationManager) stopInferenceProcess(ctx context.Context, job *OrchestrationJob) error {
+	log.Printf("Stopping inference job %s by scaling down", job.ID)
+
+	// Get config from job
+	var config InferenceConfig
+	configBytes, _ := json.Marshal(job.Config)
+	json.Unmarshal(configBytes, &config)
+
+	// Scale down to stop the server
+	args := []string{
+		"mindlet", "inference",
+		"--skip-cluster-creation",
+		"--scale-down",
+	}
+
+	// Add necessary config parameters for scale-down
+	if config.RaidMountPath != "" {
+		args = append(args, "--raid-mount-path", config.RaidMountPath)
+	}
+	if config.RaidName != "" {
+		args = append(args, "--raid-name", config.RaidName)
+	}
+
+	output, err := m.executeOrchestrationCommand(ctx, args...)
+	if err != nil {
+		return fmt.Errorf("failed to scale down inference: %w\nOutput: %s", err, string(output))
+	}
+
+	log.Printf("Inference job %s stopped successfully", job.ID)
+	return nil
 }
 
 // ExtendJob extends the expiration time of a job
@@ -466,72 +555,6 @@ func (m *OrchestrationManager) startInferenceProcess(ctx context.Context, job *O
 			// Continue waiting
 		}
 	}
-}
-
-func (m *OrchestrationManager) stopJob(ctx context.Context, job *OrchestrationJob) error {
-	job.mu.Lock()
-	if job.Status == JobStatusStopped || job.Status == JobStatusStopping {
-		job.mu.Unlock()
-		return nil
-	}
-
-	// Don't change status here - let the caller handle it
-	jobType := job.Type
-	job.mu.Unlock()
-
-	var err error
-	switch jobType {
-	case JobTypeInference:
-		err = m.stopInferenceProcess(ctx, job)
-	case JobTypeTraining:
-		// TODO: Implement training stop logic
-		err = fmt.Errorf("stopping training jobs not yet implemented")
-	}
-
-	job.mu.Lock()
-	now := time.Now()
-	job.StoppedAt = &now
-	if err != nil {
-		job.Status = JobStatusError
-		job.LastError = err
-	} else {
-		job.Status = JobStatusStopped
-	}
-	job.mu.Unlock()
-
-	return err
-}
-
-func (m *OrchestrationManager) stopInferenceProcess(ctx context.Context, job *OrchestrationJob) error {
-	log.Printf("Stopping inference job %s by scaling down", job.ID)
-
-	// Get config from job
-	var config InferenceConfig
-	configBytes, _ := json.Marshal(job.Config)
-	json.Unmarshal(configBytes, &config)
-
-	// Scale down to stop the server
-	args := []string{
-		"mindlet", "inference",
-		"--skip-cluster-creation",
-		"--scale-down",
-	}
-
-	// Add necessary config parameters for scale-down
-	if config.RaidMountPath != "" {
-		args = append(args, "--raid-mount-path", config.RaidMountPath)
-	}
-	if config.RaidName != "" {
-		args = append(args, "--raid-name", config.RaidName)
-	}
-
-	output, err := m.executeOrchestrationCommand(ctx, args...)
-	if err != nil {
-		return fmt.Errorf("failed to scale down inference: %w\nOutput: %s", err, string(output))
-	}
-
-	log.Printf("Inference job %s stopped successfully", job.ID)
-	return nil
 }
 
 func (m *OrchestrationManager) checkInferenceStatus(ctx context.Context) (map[string]interface{}, error) {

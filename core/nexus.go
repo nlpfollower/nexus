@@ -91,6 +91,8 @@ func (n *Nexus) Start() error {
 
 func (n *Nexus) Stop() {
 	n.closeOnce.Do(func() {
+		log.Printf("Nexus shutdown initiated...")
+
 		// First signal all goroutines to stop
 		close(n.done)
 
@@ -104,6 +106,25 @@ func (n *Nexus) Stop() {
 			gen.stream.Stop()
 		}
 
+		// CRITICAL: Stop all running jobs before shutdown
+		log.Printf("Stopping all running jobs for clean shutdown...")
+		runningJobs := n.orchestrationMgr.GetRunningJobs()
+		for _, job := range runningJobs {
+			job.mu.Lock()
+			jobID := job.ID
+			status := job.Status
+			job.mu.Unlock()
+
+			if status == JobStatusRunning || status == JobStatusInitializing {
+				log.Printf("Stopping job %s for clean shutdown", jobID)
+				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+				if err := n.orchestrationMgr.StopJob(ctx, jobID); err != nil {
+					log.Printf("Error stopping job %s during shutdown: %v", jobID, err)
+				}
+				cancel()
+			}
+		}
+
 		// Stop orchestration manager
 		n.orchestrationMgr.Stop()
 
@@ -112,6 +133,8 @@ func (n *Nexus) Stop() {
 
 		// Close the request tracker
 		n.queue.Close()
+
+		log.Printf("Nexus shutdown completed")
 	})
 }
 
@@ -286,11 +309,10 @@ func (n *Nexus) handleSessionRequest(req *Request) error {
 		}
 
 		// Return immediately with the job ID and initializing status
-		// Client can poll using JobStatus to check when it's ready
 		response = SessionResponse{
 			Status:    ResponseStatusSuccess,
 			SessionID: job.ID,
-			State:     string(JobStatusInitializing), // Add state field to indicate it's still starting
+			State:     string(JobStatusInitializing),
 		}
 
 	case SessionActionStop:
@@ -304,38 +326,40 @@ func (n *Nexus) handleSessionRequest(req *Request) error {
 			return fmt.Errorf("session not found: %s", sessionReq.SessionID)
 		}
 
-		// Update status to stopping immediately
 		job.mu.Lock()
 		currentStatus := job.Status
-		if currentStatus != JobStatusStopped && currentStatus != JobStatusError {
+		if currentStatus != JobStatusStopped && currentStatus != JobStatusError && currentStatus != JobStatusStopping {
 			job.Status = JobStatusStopping
 		}
 		job.mu.Unlock()
 
-		// Start the stop operation in a goroutine so we can return immediately
+		// Start the stop operation in a goroutine with proper completion tracking
 		go func() {
 			stopCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer cancel()
 
+			log.Printf("Starting stop operation for job %s", sessionReq.SessionID)
 			if err := n.orchestrationMgr.StopJob(stopCtx, sessionReq.SessionID); err != nil {
 				log.Printf("Error stopping job %s: %v", sessionReq.SessionID, err)
 				// Update status on error
 				job.mu.Lock()
 				job.Status = JobStatusError
 				job.LastError = err
+				now := time.Now()
+				job.StoppedAt = &now
 				job.mu.Unlock()
 			} else {
-				// Successfully stopped
+				// Successfully stopped - update to final stopped state
 				job.mu.Lock()
 				job.Status = JobStatusStopped
 				now := time.Now()
 				job.StoppedAt = &now
 				job.mu.Unlock()
-				log.Printf("Successfully stopped job %s", sessionReq.SessionID)
+				log.Printf("Successfully completed stop operation for job %s", sessionReq.SessionID)
 			}
 		}()
 
-		// Return immediately with success and stopping status
+		// Return immediately with stopping status
 		response = SessionResponse{
 			Status:    ResponseStatusSuccess,
 			SessionID: sessionReq.SessionID,
@@ -383,7 +407,7 @@ func (n *Nexus) handleSessionRequest(req *Request) error {
 		}
 
 	case SessionActionStatus:
-		// New action to check session status
+		// Check session status
 		if sessionReq.SessionID == "" {
 			return fmt.Errorf("session_id is required for checking status")
 		}
