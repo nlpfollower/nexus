@@ -475,7 +475,7 @@ func (m *OrchestrationManager) stopJob(ctx context.Context, job *OrchestrationJo
 		return nil
 	}
 
-	job.Status = JobStatusStopping
+	// Don't change status here - let the caller handle it
 	jobType := job.Type
 	job.mu.Unlock()
 

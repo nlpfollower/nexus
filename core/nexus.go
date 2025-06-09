@@ -298,14 +298,48 @@ func (n *Nexus) handleSessionRequest(req *Request) error {
 			return fmt.Errorf("session_id is required for stopping a session")
 		}
 
-		// Stop the specified job
-		if err := n.orchestrationMgr.StopJob(ctx, sessionReq.SessionID); err != nil {
-			return fmt.Errorf("failed to stop job: %w", err)
+		// Get the job to check if it exists and update status immediately
+		job, ok := n.orchestrationMgr.GetJob(sessionReq.SessionID)
+		if !ok {
+			return fmt.Errorf("session not found: %s", sessionReq.SessionID)
 		}
 
+		// Update status to stopping immediately
+		job.mu.Lock()
+		currentStatus := job.Status
+		if currentStatus != JobStatusStopped && currentStatus != JobStatusError {
+			job.Status = JobStatusStopping
+		}
+		job.mu.Unlock()
+
+		// Start the stop operation in a goroutine so we can return immediately
+		go func() {
+			stopCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+
+			if err := n.orchestrationMgr.StopJob(stopCtx, sessionReq.SessionID); err != nil {
+				log.Printf("Error stopping job %s: %v", sessionReq.SessionID, err)
+				// Update status on error
+				job.mu.Lock()
+				job.Status = JobStatusError
+				job.LastError = err
+				job.mu.Unlock()
+			} else {
+				// Successfully stopped
+				job.mu.Lock()
+				job.Status = JobStatusStopped
+				now := time.Now()
+				job.StoppedAt = &now
+				job.mu.Unlock()
+				log.Printf("Successfully stopped job %s", sessionReq.SessionID)
+			}
+		}()
+
+		// Return immediately with success and stopping status
 		response = SessionResponse{
 			Status:    ResponseStatusSuccess,
 			SessionID: sessionReq.SessionID,
+			State:     string(JobStatusStopping),
 		}
 
 	case SessionActionExtend:
