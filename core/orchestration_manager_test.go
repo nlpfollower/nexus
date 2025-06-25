@@ -5,13 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/nlpfollower/deltamind/orchestration/engine/node"
-	"github.com/nlpfollower/deltamind/orchestration/pkg/eks"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -181,6 +178,19 @@ func testMindletInference(t *testing.T, endpoint, modelID, modelSize string) err
 	// Prepare request for mindlet's /api/inference/stream endpoint
 	messages := []Message{
 		{Role: "user", Content: fmt.Sprintf("You are model %s. Say 'I am %s' and nothing else.", modelID, modelID)},
+	}
+
+	reqBody := map[string]interface{}{
+		"model_id":        modelID,
+		"checkpoint_path": checkpointPath,
+		"model_size":      modelSize,
+		"messages":        messages,
+		"max_tokens":      50,
+	}
+
+	jsonBodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %w", err)
 	}
 
 	// Create a mock session to test the endpoint
@@ -416,131 +426,4 @@ func createHTTPClient() *http.Client {
 			IdleConnTimeout:     90 * time.Second,
 		},
 	}
-}
-
-// outputErrorStatus outputs a JSON error status
-func outputErrorStatus(errorMsg string) {
-	status := &InferenceServerStatus{
-		ProcessRunning: false,
-		Port:           5000,
-		Status:         "error",
-		Ready:          false,
-		Error:          errorMsg,
-	}
-	statusJSON, _ := json.MarshalIndent(status, "", "  ")
-	fmt.Println(string(statusJSON))
-}
-
-// InferenceServerStatus represents the status of the inference server
-type InferenceServerStatus struct {
-	ProcessRunning bool   `json:"process_running"`
-	PID            int    `json:"pid,omitempty"`
-	Port           int    `json:"port"`
-	Status         string `json:"status"` // "healthy", "unhealthy", "not_running", "error"
-	Model          string `json:"model,omitempty"`
-	Ready          bool   `json:"ready"`
-	Error          string `json:"error,omitempty"`
-	Endpoint       string `json:"endpoint,omitempty"`
-}
-
-// checkInferenceServerStatus checks the status of the inference server
-func checkMindletServerStatus(ctx context.Context, headNode *node.Node, keyPath string, cluster *eks.Cluster) (*InferenceServerStatus, error) {
-	status := &InferenceServerStatus{
-		Port:   9090, // default mindlet port
-		Status: "not_running",
-	}
-
-	// First check if the process is running by looking for PID file
-	pidCheckCmd := `
-if [ -f $HOME/mindlet.pid ]; then
-    PID=$(cat $HOME/mindlet.pid)
-    if kill -0 $PID 2>/dev/null; then
-        # Extract port from command line
-        PORT=$(ps -p $PID -o args= | grep -oP '(?<=--port )\d+' || echo "9090")
-        echo "RUNNING:$PID:$PORT"
-    else
-        echo "NOT_RUNNING:0:0"
-    fi
-else
-    # If no PID file, check if mindlet server is running anyway
-    PID=$(pgrep -f "mindlet.*start" | head -1)
-    if [ -n "$PID" ]; then
-        PORT=$(ps -p $PID -o args= | grep -oP '(?<=--port )\d+' || echo "9090")
-        echo "RUNNING:$PID:$PORT"
-    else
-        echo "NOT_RUNNING:0:0"
-    fi
-fi
-`
-	output, err := headNode.ExecuteCommand(ctx, keyPath, pidCheckCmd, false)
-	if err == nil {
-		// Parse the output
-		parts := strings.Split(strings.TrimSpace(output), ":")
-		if len(parts) >= 3 {
-			if parts[0] == "RUNNING" {
-				status.ProcessRunning = true
-				if pid, err := strconv.Atoi(parts[1]); err == nil {
-					status.PID = pid
-				}
-				if port, err := strconv.Atoi(parts[2]); err == nil {
-					status.Port = port
-				}
-			}
-		}
-	}
-
-	// Always try to check the health endpoint
-	healthCheckCmd := fmt.Sprintf(`curl -s -f -m 5 http://localhost:%d/health 2>/dev/null`, status.Port)
-
-	healthOutput, err := headNode.ExecuteCommand(ctx, keyPath, healthCheckCmd, false)
-	if err != nil {
-		// curl failed - server is not responding
-		if status.ProcessRunning {
-			status.Status = "unhealthy"
-			status.Error = "process running but not responding to health check"
-		} else {
-			status.Status = "not_running"
-		}
-		return status, nil
-	}
-
-	// Parse the health check response
-	var healthResponse map[string]interface{}
-	if err := json.Unmarshal([]byte(healthOutput), &healthResponse); err != nil {
-		// Got a response but it's not valid JSON
-		if status.ProcessRunning {
-			status.Status = "unhealthy"
-			status.Error = "invalid health check response"
-		}
-		return status, nil
-	}
-
-	// Update status based on health check
-	if healthStatus, ok := healthResponse["status"].(string); ok {
-		status.Status = healthStatus
-		status.Ready = (healthStatus == "healthy")
-
-		// If health check succeeded but we didn't find process, mark it as running
-		if status.Ready && !status.ProcessRunning {
-			status.ProcessRunning = true
-			// Try to find the process again
-			pidFindCmd := `pgrep -f "mindlet.*start" | head -1`
-			if pidOutput, err := headNode.ExecuteCommand(ctx, keyPath, pidFindCmd, false); err == nil {
-				if pid, err := strconv.Atoi(strings.TrimSpace(pidOutput)); err == nil {
-					status.PID = pid
-				}
-			}
-		}
-	}
-
-	// Extract current model from health response
-	if currentModel, ok := healthResponse["current_model"].(string); ok && currentModel != "" {
-		status.Model = currentModel
-	}
-
-	if status.Ready {
-		status.Endpoint = fmt.Sprintf("http://%s:%d", headNode.PrivateIP, status.Port)
-	}
-
-	return status, nil
 }
