@@ -247,7 +247,7 @@ func (n *Nexus) handleInference(req *Request) error {
 	}
 
 	// Get or create an inference session for this model
-	sessionCtx, sessionCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	sessionCtx, sessionCancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer sessionCancel()
 
 	session, err := n.orchestrationMgr.GetOrCreateInferenceSession(sessionCtx, inferReq.ModelID, modelPath)

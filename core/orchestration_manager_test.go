@@ -32,8 +32,8 @@ func TestOrchestrationManager_BasicLifecycle(t *testing.T) {
 		t.Skip("Orchestration directory not found, skipping test")
 	}
 
-	// Create manager with 5 minute expiration
-	manager, err := NewOrchestrationManager(5 * time.Minute)
+	// Create manager with 30 minute expiration
+	manager, err := NewOrchestrationManager(30 * time.Minute)
 	require.NoError(t, err)
 
 	manager.Start()
@@ -84,7 +84,7 @@ func TestOrchestrationManager_MindletInference(t *testing.T) {
 	}
 
 	// This test actually starts a mindlet server and tests model switching
-	manager, err := NewOrchestrationManager(10 * time.Minute)
+	manager, err := NewOrchestrationManager(30 * time.Minute)
 	require.NoError(t, err)
 
 	manager.Start()
@@ -246,7 +246,7 @@ func TestOrchestrationManager_SessionReuse(t *testing.T) {
 		t.Skip("Orchestration directory not found, skipping test")
 	}
 
-	manager, err := NewOrchestrationManager(5 * time.Minute)
+	manager, err := NewOrchestrationManager(30 * time.Minute)
 	require.NoError(t, err)
 
 	manager.Start()
@@ -288,7 +288,7 @@ func TestOrchestrationManager_ClonedModel(t *testing.T) {
 		t.Skip("Orchestration directory not found")
 	}
 
-	manager, err := NewOrchestrationManager(10 * time.Minute)
+	manager, err := NewOrchestrationManager(30 * time.Minute)
 	require.NoError(t, err)
 
 	manager.Start()
