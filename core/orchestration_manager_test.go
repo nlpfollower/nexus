@@ -179,7 +179,7 @@ func testMindletInference(t *testing.T, endpoint, modelID, modelSize string) err
 	}
 
 	// Create a session using the constructor
-	session := NewInferenceSession("test-session", modelID, 5*time.Minute, false)
+	session := NewInferenceSession("test-session", modelID, 30*time.Minute, false)
 	session.SetCheckpointPath(checkpointPath)
 	session.SetModelSize(modelSize)
 	session.Status = SessionStatusRunning
