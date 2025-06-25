@@ -3,11 +3,15 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"github.com/nlpfollower/deltamind/orchestration/engine/node"
+	"github.com/nlpfollower/deltamind/orchestration/pkg/eks"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -25,16 +29,6 @@ func orchestrationDirExists() bool {
 	orchestrationDir := filepath.Join(homeDir, "orchestration")
 	_, err = os.Stat(orchestrationDir)
 	return err == nil
-}
-
-// Helper to get test models based on environment
-func getTestModels() (model1, model2, size1, size2 string) {
-	if os.Getenv("RUN_LOCAL") != "" {
-		// Local testing with smaller models
-		return "llama-3b", "llama-8b", "3B", "8B"
-	}
-	// Production testing
-	return "llama-8b", "llama-70b", "8B", "70B"
 }
 
 // TestOrchestrationManager_BasicLifecycle tests the basic functionality without starting real servers
@@ -90,10 +84,6 @@ func TestOrchestrationManager_BasicLifecycle(t *testing.T) {
 
 // TestOrchestrationManager_MindletInference tests real mindlet server with model switching
 func TestOrchestrationManager_MindletInference(t *testing.T) {
-	if os.Getenv("RUN_INFERENCE_TEST") != "true" {
-		t.Skip("Skipping real inference test. Set RUN_INFERENCE_TEST=true to run.")
-	}
-
 	if !orchestrationDirExists() {
 		t.Skip("Orchestration directory not found")
 	}
@@ -150,23 +140,20 @@ func TestOrchestrationManager_MindletInference(t *testing.T) {
 	require.Equal(t, JobStatusRunning, finalStatus, "Server should be running")
 	require.NotEmpty(t, endpoint, "Endpoint should be set")
 
-	// Get test models
-	model1, model2, size1, size2 := getTestModels()
-
-	// Test inference with first model
-	t.Logf("Testing inference with %s (%s)", model1, size1)
-	err = testMindletInference(t, endpoint, model1, size1)
+	// Test inference with first model (8B)
+	t.Log("Testing inference with llama-8b (8B)")
+	err = testMindletInference(t, endpoint, "llama-8b", "8B")
 	require.NoError(t, err)
 
-	// Test inference with second model (triggers model switch)
-	t.Logf("Testing inference with %s (%s) - should trigger model switch", model2, size2)
-	err = testMindletInference(t, endpoint, model2, size2)
+	// Test inference with second model (70B) - triggers model switch
+	t.Log("Testing inference with llama-70b (70B) - should trigger model switch")
+	err = testMindletInference(t, endpoint, "llama-70b", "70B")
 	require.NoError(t, err)
 
 	// Test switching back to first model (should be faster)
-	t.Logf("Testing switch back to %s (%s) - should reuse loaded model", model1, size1)
+	t.Log("Testing switch back to llama-8b (8B) - should reuse loaded model")
 	startTime := time.Now()
-	err = testMindletInference(t, endpoint, model1, size1)
+	err = testMindletInference(t, endpoint, "llama-8b", "8B")
 	require.NoError(t, err)
 	switchTime := time.Since(startTime)
 	t.Logf("Model switch took %v", switchTime)
@@ -188,15 +175,8 @@ func TestOrchestrationManager_MindletInference(t *testing.T) {
 
 // testMindletInference sends a test request to the mindlet server
 func testMindletInference(t *testing.T, endpoint, modelID, modelSize string) error {
-	// Determine checkpoint path based on environment and model
-	var checkpointPath string
-	if os.Getenv("RUN_LOCAL") != "" {
-		// Local testing paths
-		checkpointPath = fmt.Sprintf("/home/nlpfollower/Desktop/deltamind/torchtitan/outputs/models/%s/checkpoint", modelID)
-	} else {
-		// Production paths
-		checkpointPath = fmt.Sprintf("/mnt/cold/contents/dcp/%s/checkpoint", modelID)
-	}
+	// Production checkpoint path with /checkpoint suffix
+	checkpointPath := fmt.Sprintf("/mnt/cold/contents/dcp/%s/checkpoint", modelID)
 
 	// Prepare request for mindlet's /api/inference/stream endpoint
 	messages := []Message{
@@ -207,8 +187,8 @@ func testMindletInference(t *testing.T, endpoint, modelID, modelSize string) err
 	session := &InferenceSession{
 		ID:             "test-session",
 		ModelID:        modelID,
-		CheckpointPath: checkpointPath, // Set checkpoint path
-		ModelSize:      modelSize,      // Set model size
+		CheckpointPath: checkpointPath,
+		ModelSize:      modelSize,
 		Status:         SessionStatusRunning,
 		Endpoint:       parseEndpoint(endpoint),
 		Expiration:     time.Now().Add(5 * time.Minute),
@@ -270,12 +250,50 @@ func testMindletInference(t *testing.T, endpoint, modelID, modelSize string) err
 	return nil
 }
 
-// Additional test to verify cloned model support
-func TestOrchestrationManager_ClonedModel(t *testing.T) {
-	if os.Getenv("RUN_INFERENCE_TEST") != "true" {
-		t.Skip("Skipping real inference test. Set RUN_INFERENCE_TEST=true to run.")
+// TestOrchestrationManager_SessionReuse tests that mindlet sessions can be reused
+func TestOrchestrationManager_SessionReuse(t *testing.T) {
+	if !orchestrationDirExists() {
+		t.Skip("Orchestration directory not found, skipping test")
 	}
 
+	manager, err := NewOrchestrationManager(5 * time.Minute)
+	require.NoError(t, err)
+
+	manager.Start()
+	defer manager.Stop()
+
+	// Manually create a running job
+	job1 := &OrchestrationJob{
+		ID:         "job-1",
+		Type:       JobTypeInference,
+		Status:     JobStatusRunning,
+		ModelID:    "mindlet-server",
+		Endpoint:   "http://localhost:9090",
+		CreatedAt:  time.Now(),
+		Expiration: time.Now().Add(5 * time.Minute),
+	}
+	manager.jobs.Set(job1.ID, job1)
+
+	// GetOrCreateInferenceSession should return existing session
+	ctx := context.Background()
+	session1, err := manager.GetOrCreateInferenceSession(ctx, "llama-8b", "/mnt/cold/contents/dcp/llama-8b/checkpoint")
+	require.NoError(t, err)
+	require.Equal(t, job1.ID, session1.ID)
+	require.Equal(t, "llama-8b", session1.ModelID)
+	require.Equal(t, "/mnt/cold/contents/dcp/llama-8b/checkpoint", session1.CheckpointPath)
+
+	// Second call should return same session (mindlet can handle multiple models)
+	session2, err := manager.GetOrCreateInferenceSession(ctx, "llama-70b", "/mnt/cold/contents/dcp/llama-70b/checkpoint")
+	require.NoError(t, err)
+	require.Equal(t, session1.ID, session2.ID)
+	require.Equal(t, "llama-70b", session2.ModelID)
+	require.Equal(t, "/mnt/cold/contents/dcp/llama-70b/checkpoint", session2.CheckpointPath)
+
+	t.Log("Session reuse test passed - mindlet server can handle multiple models")
+}
+
+// TestOrchestrationManager_ClonedModel tests support for cloned models
+func TestOrchestrationManager_ClonedModel(t *testing.T) {
 	if !orchestrationDirExists() {
 		t.Skip("Orchestration directory not found")
 	}
@@ -345,46 +363,6 @@ func TestOrchestrationManager_ClonedModel(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// TestOrchestrationManager_SessionReuse tests that mindlet sessions can be reused
-func TestOrchestrationManager_SessionReuse(t *testing.T) {
-	if !orchestrationDirExists() {
-		t.Skip("Orchestration directory not found, skipping test")
-	}
-
-	manager, err := NewOrchestrationManager(5 * time.Minute)
-	require.NoError(t, err)
-
-	manager.Start()
-	defer manager.Stop()
-
-	// Manually create a running job
-	job1 := &OrchestrationJob{
-		ID:         "job-1",
-		Type:       JobTypeInference,
-		Status:     JobStatusRunning,
-		ModelID:    "mindlet-server",
-		Endpoint:   "http://localhost:9090",
-		CreatedAt:  time.Now(),
-		Expiration: time.Now().Add(5 * time.Minute),
-	}
-	manager.jobs.Set(job1.ID, job1)
-
-	// GetOrCreateInferenceSession should return existing session
-	ctx := context.Background()
-	session1, err := manager.GetOrCreateInferenceSession(ctx, "llama-8b", "/path/to/model")
-	require.NoError(t, err)
-	require.Equal(t, job1.ID, session1.ID)
-	require.Equal(t, "llama-8b", session1.ModelID) // Should use requested model ID
-
-	// Second call should return same session (mindlet can handle multiple models)
-	session2, err := manager.GetOrCreateInferenceSession(ctx, "llama-70b", "/path/to/model2")
-	require.NoError(t, err)
-	require.Equal(t, session1.ID, session2.ID)
-	require.Equal(t, "llama-70b", session2.ModelID) // Should use new model ID
-
-	t.Log("Session reuse test passed - mindlet server can handle multiple models")
-}
-
 // TestOrchestrationManager_Expiration tests job expiration
 func TestOrchestrationManager_Expiration(t *testing.T) {
 	if !orchestrationDirExists() {
@@ -438,4 +416,131 @@ func createHTTPClient() *http.Client {
 			IdleConnTimeout:     90 * time.Second,
 		},
 	}
+}
+
+// outputErrorStatus outputs a JSON error status
+func outputErrorStatus(errorMsg string) {
+	status := &InferenceServerStatus{
+		ProcessRunning: false,
+		Port:           5000,
+		Status:         "error",
+		Ready:          false,
+		Error:          errorMsg,
+	}
+	statusJSON, _ := json.MarshalIndent(status, "", "  ")
+	fmt.Println(string(statusJSON))
+}
+
+// InferenceServerStatus represents the status of the inference server
+type InferenceServerStatus struct {
+	ProcessRunning bool   `json:"process_running"`
+	PID            int    `json:"pid,omitempty"`
+	Port           int    `json:"port"`
+	Status         string `json:"status"` // "healthy", "unhealthy", "not_running", "error"
+	Model          string `json:"model,omitempty"`
+	Ready          bool   `json:"ready"`
+	Error          string `json:"error,omitempty"`
+	Endpoint       string `json:"endpoint,omitempty"`
+}
+
+// checkInferenceServerStatus checks the status of the inference server
+func checkMindletServerStatus(ctx context.Context, headNode *node.Node, keyPath string, cluster *eks.Cluster) (*InferenceServerStatus, error) {
+	status := &InferenceServerStatus{
+		Port:   9090, // default mindlet port
+		Status: "not_running",
+	}
+
+	// First check if the process is running by looking for PID file
+	pidCheckCmd := `
+if [ -f $HOME/mindlet.pid ]; then
+    PID=$(cat $HOME/mindlet.pid)
+    if kill -0 $PID 2>/dev/null; then
+        # Extract port from command line
+        PORT=$(ps -p $PID -o args= | grep -oP '(?<=--port )\d+' || echo "9090")
+        echo "RUNNING:$PID:$PORT"
+    else
+        echo "NOT_RUNNING:0:0"
+    fi
+else
+    # If no PID file, check if mindlet server is running anyway
+    PID=$(pgrep -f "mindlet.*start" | head -1)
+    if [ -n "$PID" ]; then
+        PORT=$(ps -p $PID -o args= | grep -oP '(?<=--port )\d+' || echo "9090")
+        echo "RUNNING:$PID:$PORT"
+    else
+        echo "NOT_RUNNING:0:0"
+    fi
+fi
+`
+	output, err := headNode.ExecuteCommand(ctx, keyPath, pidCheckCmd, false)
+	if err == nil {
+		// Parse the output
+		parts := strings.Split(strings.TrimSpace(output), ":")
+		if len(parts) >= 3 {
+			if parts[0] == "RUNNING" {
+				status.ProcessRunning = true
+				if pid, err := strconv.Atoi(parts[1]); err == nil {
+					status.PID = pid
+				}
+				if port, err := strconv.Atoi(parts[2]); err == nil {
+					status.Port = port
+				}
+			}
+		}
+	}
+
+	// Always try to check the health endpoint
+	healthCheckCmd := fmt.Sprintf(`curl -s -f -m 5 http://localhost:%d/health 2>/dev/null`, status.Port)
+
+	healthOutput, err := headNode.ExecuteCommand(ctx, keyPath, healthCheckCmd, false)
+	if err != nil {
+		// curl failed - server is not responding
+		if status.ProcessRunning {
+			status.Status = "unhealthy"
+			status.Error = "process running but not responding to health check"
+		} else {
+			status.Status = "not_running"
+		}
+		return status, nil
+	}
+
+	// Parse the health check response
+	var healthResponse map[string]interface{}
+	if err := json.Unmarshal([]byte(healthOutput), &healthResponse); err != nil {
+		// Got a response but it's not valid JSON
+		if status.ProcessRunning {
+			status.Status = "unhealthy"
+			status.Error = "invalid health check response"
+		}
+		return status, nil
+	}
+
+	// Update status based on health check
+	if healthStatus, ok := healthResponse["status"].(string); ok {
+		status.Status = healthStatus
+		status.Ready = (healthStatus == "healthy")
+
+		// If health check succeeded but we didn't find process, mark it as running
+		if status.Ready && !status.ProcessRunning {
+			status.ProcessRunning = true
+			// Try to find the process again
+			pidFindCmd := `pgrep -f "mindlet.*start" | head -1`
+			if pidOutput, err := headNode.ExecuteCommand(ctx, keyPath, pidFindCmd, false); err == nil {
+				if pid, err := strconv.Atoi(strings.TrimSpace(pidOutput)); err == nil {
+					status.PID = pid
+				}
+			}
+		}
+	}
+
+	// Extract current model from health response
+	if currentModel, ok := healthResponse["current_model"].(string); ok && currentModel != "" {
+		status.Model = currentModel
+	}
+
+	if status.Ready {
+		status.Endpoint = fmt.Sprintf("http://%s:%d", headNode.PrivateIP, status.Port)
+	}
+
+	return status, nil
 }
