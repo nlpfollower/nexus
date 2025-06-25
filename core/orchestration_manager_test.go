@@ -3,7 +3,6 @@ package core
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -178,19 +177,6 @@ func testMindletInference(t *testing.T, endpoint, modelID, modelSize string) err
 	// Prepare request for mindlet's /api/inference/stream endpoint
 	messages := []Message{
 		{Role: "user", Content: fmt.Sprintf("You are model %s. Say 'I am %s' and nothing else.", modelID, modelID)},
-	}
-
-	reqBody := map[string]interface{}{
-		"model_id":        modelID,
-		"checkpoint_path": checkpointPath,
-		"model_size":      modelSize,
-		"messages":        messages,
-		"max_tokens":      50,
-	}
-
-	jsonBodyBytes, err := json.Marshal(reqBody)
-	if err != nil {
-		return fmt.Errorf("failed to marshal request: %w", err)
 	}
 
 	// Create a mock session to test the endpoint
