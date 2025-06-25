@@ -212,6 +212,10 @@ func (n *Nexus) processRequest(req *Request) error {
 		return n.handleSessionRequest(req)
 	case RequestTypeJobStatus:
 		return n.handleJobStatus(req)
+	case RequestTypeTraining:
+		return n.handleTraining(req)
+	case RequestTypeTrainingStatus:
+		return n.handleTrainingStatus(req)
 	default:
 		return fmt.Errorf("unknown request type: %s", req.Type)
 	}
@@ -231,18 +235,28 @@ func (n *Nexus) handleInference(req *Request) error {
 		return n.handleAPIInference(req)
 	}
 
+	// Use checkpoint path from request if provided, otherwise fall back to model path
+	var modelPath string
+	if inferReq.CheckpointPath != "" {
+		modelPath = inferReq.CheckpointPath
+		log.Printf("Using checkpoint path from request: %s", modelPath)
+	} else {
+		// Fallback for base models that don't have checkpoint path in request
+		modelPath = fmt.Sprintf("/mnt/cold-storage/contents/dcp/%s", inferReq.ModelID)
+		log.Printf("Using default model path: %s", modelPath)
+	}
+
 	// Get or create an inference session for this model
-	// Use a separate context for session creation
 	sessionCtx, sessionCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer sessionCancel()
 
-	session, err := n.orchestrationMgr.GetOrCreateInferenceSession(sessionCtx, inferReq.ModelID)
+	session, err := n.orchestrationMgr.GetOrCreateInferenceSession(sessionCtx, inferReq.ModelID, modelPath)
 	if err != nil {
 		return fmt.Errorf("failed to get/create inference session: %w", err)
 	}
 
 	// Process the inference request with a fresh context
-	inferenceCtx := context.Background() // Don't use a timeout for streaming
+	inferenceCtx := context.Background()
 	stream, err := session.ProcessInference(inferenceCtx, inferReq.Messages)
 	if err != nil {
 		return fmt.Errorf("failed to process inference: %w", err)
@@ -543,6 +557,82 @@ func (n *Nexus) handleInferenceStream(req *Request, stream GenerationStream) {
 	}
 }
 
+func (n *Nexus) handleTraining(req *Request) error {
+	trainReq, ok := req.Data.(*TrainingRequest)
+	if !ok {
+		return fmt.Errorf("invalid training request data")
+	}
+
+	// TODO: Create training configuration
+	trainingConfig := map[string]interface{}{
+		"source_model_id": trainReq.SourceModelID,
+		"target_model_id": trainReq.TargetModelID,
+		"checkpoint_path": trainReq.CheckpointPath,
+		"output_path":     trainReq.OutputPath,
+		"dataset_path":    trainReq.DatasetPath,
+		"learning_rate":   trainReq.LearningRate,
+		"batch_size":      trainReq.BatchSize,
+		"num_epochs":      trainReq.NumEpochs,
+	}
+
+	// Start training job via orchestration manager
+	job, err := n.orchestrationMgr.StartTrainingJob(
+		context.Background(),
+		trainReq.TargetModelID,
+		trainingConfig,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to start training job: %w", err)
+	}
+
+	// Send initial response
+	resp := &TrainingResponse{
+		JobID:  job.ID,
+		Status: string(job.Status),
+	}
+	n.sendWrappedResponse(req, resp)
+	return nil
+}
+
+// Add handler for training status requests
+func (n *Nexus) handleTrainingStatus(req *Request) error {
+	statusReq, ok := req.Data.(*TrainingStatusRequest)
+	if !ok {
+		return fmt.Errorf("invalid training status request data")
+	}
+
+	// Get job info from orchestration manager
+	jobInfo, err := n.orchestrationMgr.GetJobStatus(context.Background(), statusReq.JobID)
+	if err != nil {
+		return fmt.Errorf("failed to get job status: %w", err)
+	}
+
+	// Convert to training status response
+	resp := &TrainingStatusResponse{
+		JobID:  jobInfo.ID,
+		Status: string(jobInfo.Status),
+		// Progress would need to be extracted from LiveStatus or job metadata
+		Progress: 0.0, // TODO: Get actual progress from job
+	}
+
+	if jobInfo.StartedAt != nil {
+		resp.StartedAt = *jobInfo.StartedAt
+	}
+	if jobInfo.StoppedAt != nil {
+		resp.CompletedAt = jobInfo.StoppedAt
+	}
+
+	// Check for errors
+	if jobInfo.Status == JobStatusError {
+		if errorMsg, ok := jobInfo.LiveStatus["error"].(string); ok {
+			resp.Error = errorMsg
+		}
+	}
+
+	n.sendWrappedResponse(req, resp)
+	return nil
+}
+
 // Helper methods for sending responses
 func (n *Nexus) sendPartialResponse(req *Request, content string) {
 	resp := &InferenceResponse{
@@ -589,6 +679,17 @@ func (n *Nexus) sendErrorResponse(req *Request, err error) {
 	case RequestTypeJobStatus:
 		resp = &JobStatusResponse{
 			Status: ResponseStatusError,
+			Error:  errorContent,
+		}
+	case RequestTypeTraining:
+		resp = &TrainingResponse{
+			JobID:  "",
+			Status: "error",
+		}
+	case RequestTypeTrainingStatus:
+		resp = &TrainingStatusResponse{
+			JobID:  "",
+			Status: "error",
 			Error:  errorContent,
 		}
 	default:

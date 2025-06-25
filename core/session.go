@@ -17,15 +17,17 @@ import (
 
 // InferenceSession represents a running inference endpoint
 type InferenceSession struct {
-	ID           string
-	ModelID      string
-	Status       SessionStatus
-	Endpoint     *url.URL
-	Expiration   time.Time
-	LastError    error
-	MaxIdleTime  time.Duration
-	IsPersistent bool
-	httpClient   *http.Client
+	ID             string
+	ModelID        string
+	CheckpointPath string // Added: Path to the actual model checkpoint
+	ModelSize      string // Added: Model size (3B, 8B, 70B, etc.)
+	Status         SessionStatus
+	Endpoint       *url.URL
+	Expiration     time.Time
+	LastError      error
+	MaxIdleTime    time.Duration
+	IsPersistent   bool
+	httpClient     *http.Client
 }
 
 // InferenceEndpointRequest represents the request body sent to inference endpoints
@@ -83,12 +85,20 @@ func (s *InferenceSession) ProcessInference(ctx context.Context, messages []Mess
 		return nil, fmt.Errorf("session has no endpoint URL")
 	}
 
-	// Create the request body
-	reqBody := InferenceEndpointRequest{
-		Stream:    true,
-		Model:     "", // Keep model field empty as required by the inference server
-		Messages:  messages,
-		MaxTokens: 300,
+	// Create the request body for mindlet API
+	// Include checkpoint_path to support cloned models
+	reqBody := struct {
+		ModelID        string    `json:"model_id"`
+		CheckpointPath string    `json:"checkpoint_path,omitempty"`
+		ModelSize      string    `json:"model_size,omitempty"`
+		Messages       []Message `json:"messages"`
+		MaxTokens      int       `json:"max_tokens"`
+	}{
+		ModelID:        s.ModelID,
+		CheckpointPath: s.CheckpointPath, // Include checkpoint path if set
+		ModelSize:      s.ModelSize,      // Include model size if set
+		Messages:       messages,
+		MaxTokens:      300,
 	}
 
 	// Serialize request body
@@ -97,16 +107,19 @@ func (s *InferenceSession) ProcessInference(ctx context.Context, messages []Mess
 		return nil, fmt.Errorf("failed to marshal request body: %w", err)
 	}
 
-	// Create HTTP request
+	// Create HTTP request to mindlet's streaming endpoint
 	endpointURL := s.Endpoint.String()
-	if !strings.HasSuffix(endpointURL, "/v1/chat/completions") {
+	if !strings.HasSuffix(endpointURL, "/api/inference/stream") {
 		if !strings.HasSuffix(endpointURL, "/") {
 			endpointURL += "/"
 		}
-		endpointURL += "v1/chat/completions"
+		endpointURL += "api/inference/stream"
 	}
 
-	log.Printf("Sending inference request to %s", endpointURL)
+	log.Printf("Sending inference request to mindlet at %s for model %s", endpointURL, s.ModelID)
+	if s.CheckpointPath != "" {
+		log.Printf("Using checkpoint path: %s", s.CheckpointPath)
+	}
 
 	// Use a background context for the HTTP request to avoid cancellation issues
 	req, err := http.NewRequestWithContext(context.Background(), "POST", endpointURL, bytes.NewBuffer(jsonBody))
@@ -127,7 +140,7 @@ func (s *InferenceSession) ProcessInference(ctx context.Context, messages []Mess
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		return nil, fmt.Errorf("inference endpoint returned error: %s - %s", resp.Status, string(body))
+		return nil, fmt.Errorf("mindlet endpoint returned error: %s - %s", resp.Status, string(body))
 	}
 
 	// Create a stream to handle the response
@@ -182,7 +195,7 @@ func (s *InferenceSession) ProcessInference(ctx context.Context, messages []Mess
 						return
 					}
 
-					// Parse JSON response
+					// Parse JSON response (mindlet forwards VLLM format)
 					var streamResp InferenceEndpointResponse
 					if err := json.Unmarshal([]byte(dataContent), &streamResp); err != nil {
 						log.Printf("Error parsing JSON: %v, data: %s", err, dataContent)
@@ -263,4 +276,14 @@ func (s *InferenceSession) TimeRemaining() time.Duration {
 // IsExpired checks if the session has expired
 func (s *InferenceSession) IsExpired() bool {
 	return time.Now().After(s.Expiration)
+}
+
+// SetCheckpointPath sets the checkpoint path for the session
+func (s *InferenceSession) SetCheckpointPath(path string) {
+	s.CheckpointPath = path
+}
+
+// SetModelSize sets the model size for the session
+func (s *InferenceSession) SetModelSize(size string) {
+	s.ModelSize = size
 }

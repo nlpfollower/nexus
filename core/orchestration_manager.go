@@ -164,6 +164,35 @@ func (m *OrchestrationManager) StartInferenceJob(ctx context.Context, modelID st
 	return job, nil
 }
 
+func (m *OrchestrationManager) StartTrainingJob(ctx context.Context, targetModelID string, config map[string]interface{}) (*OrchestrationJob, error) {
+	jobID := uuid.New().String()
+
+	job := &OrchestrationJob{
+		ID:         jobID,
+		Type:       JobTypeTraining,
+		Status:     JobStatusPending,
+		ModelID:    targetModelID,
+		Config:     config,
+		CreatedAt:  time.Now(),
+		Expiration: time.Now().Add(m.defaultExpiration * 4), // Training jobs need more time
+	}
+
+	m.jobs.Set(jobID, job)
+
+	// Start the job asynchronously
+	go func() {
+		if err := m.startTrainingProcess(ctx, job); err != nil {
+			job.mu.Lock()
+			job.Status = JobStatusError
+			job.LastError = err
+			job.mu.Unlock()
+			log.Printf("Failed to start training job %s: %v", jobID, err)
+		}
+	}()
+
+	return job, nil
+}
+
 // GetJob retrieves a job by ID
 func (m *OrchestrationManager) GetJob(jobID string) (*OrchestrationJob, bool) {
 	return m.jobs.Get(jobID)
@@ -230,8 +259,7 @@ func (m *OrchestrationManager) stopJob(ctx context.Context, job *OrchestrationJo
 	case JobTypeInference:
 		err = m.stopInferenceProcess(ctx, job)
 	case JobTypeTraining:
-		// TODO: Implement training stop logic
-		err = fmt.Errorf("stopping training jobs not yet implemented")
+		err = m.stopTrainingProcess(ctx, job) // NEW
 	}
 
 	// Update final status
@@ -280,6 +308,24 @@ func (m *OrchestrationManager) stopInferenceProcess(ctx context.Context, job *Or
 	}
 
 	log.Printf("Inference job %s stopped successfully", job.ID)
+	return nil
+}
+
+func (m *OrchestrationManager) stopTrainingProcess(ctx context.Context, job *OrchestrationJob) error {
+	log.Printf("Stopping training job %s", job.ID)
+
+	args := []string{
+		"mindlet", "training", "stop",
+		"--job-id", job.ID,
+		"--skip-cluster-creation",
+	}
+
+	output, err := m.executeOrchestrationCommand(ctx, args...)
+	if err != nil {
+		return fmt.Errorf("failed to stop training: %w\nOutput: %s", err, string(output))
+	}
+
+	log.Printf("Training job %s stopped successfully", job.ID)
 	return nil
 }
 
@@ -341,11 +387,11 @@ func (m *OrchestrationManager) GetJobStatus(ctx context.Context, jobID string) (
 }
 
 // GetOrCreateInferenceSession gets or creates an inference session for the given model
-func (m *OrchestrationManager) GetOrCreateInferenceSession(ctx context.Context, modelID string) (*InferenceSession, error) {
-	// Check for existing running inference jobs for this model
+func (m *OrchestrationManager) GetOrCreateInferenceSession(ctx context.Context, modelID string, modelPath string) (*InferenceSession, error) {
+	// Check for existing running inference jobs (mindlet servers)
 	for _, job := range m.jobs.GetAll() {
 		job.mu.RLock()
-		isRunning := job.Status == JobStatusRunning && job.ModelID == modelID && job.Type == JobTypeInference
+		isRunning := job.Status == JobStatusRunning && job.Type == JobTypeInference
 		endpoint := job.Endpoint
 		jobID := job.ID
 		expiration := job.Expiration
@@ -358,38 +404,39 @@ func (m *OrchestrationManager) GetOrCreateInferenceSession(ctx context.Context, 
 				continue
 			}
 
+			// The mindlet server can handle multiple models, so we can reuse it
 			session := &InferenceSession{
-				ID:           jobID,
-				ModelID:      modelID,
-				Status:       SessionStatusRunning,
-				Endpoint:     endpointURL,
-				Expiration:   expiration,
-				IsPersistent: false,
-				httpClient:   &http.Client{Timeout: 60 * time.Second},
+				ID:             jobID,
+				ModelID:        modelID,
+				CheckpointPath: modelPath, // Set the checkpoint path
+				ModelSize:      "8B",      // Default size, could be made configurable
+				Status:         SessionStatusRunning,
+				Endpoint:       endpointURL,
+				Expiration:     expiration,
+				IsPersistent:   false,
+				httpClient:     &http.Client{Timeout: 60 * time.Second},
 			}
 
-			log.Printf("Reusing existing session %s for model %s at %s", jobID, modelID, endpoint)
+			log.Printf("Reusing existing mindlet session %s for model %s at %s", jobID, modelID, endpoint)
+			if modelPath != "" && modelPath != modelID {
+				log.Printf("Using checkpoint path: %s", modelPath)
+			}
 			return session, nil
 		}
 	}
 
-	// No existing session, start a new inference job with default config
-	// Use the actual llama-8b checkpoint that exists
+	// No existing session, start a new mindlet server
+	// Simplified config - mindlet handles model details internally
 	config := InferenceConfig{
-		DCPDir:           "/mnt/cold/contents/dcp/llama-8b/step-0",
-		TokenizerPath:    "/mnt/cold/contents/checkpoints/Llama3.1-8B-Instruct/tokenizer.model",
-		ParamsPath:       "torchchat/model_params/Meta-Llama-3.1-8B.json",
-		Port:             5000,
-		DCPModelSize:     "8B",
-		CheckpointFolder: "llama-8b",
-		NodeCount:        1,
-		RaidMountPath:    "/mnt/cold",
-		RaidName:         "cold-new",
+		Port:          9090, // Default mindlet port
+		NodeCount:     1,
+		RaidMountPath: "/mnt/cold-storage",
+		RaidName:      "cold-storage",
 	}
 
 	job, err := m.StartInferenceJob(ctx, modelID, config)
 	if err != nil {
-		return nil, fmt.Errorf("failed to start inference job: %w", err)
+		return nil, fmt.Errorf("failed to start mindlet server: %w", err)
 	}
 
 	// Wait for the job to be ready
@@ -403,7 +450,7 @@ func (m *OrchestrationManager) GetOrCreateInferenceSession(ctx context.Context, 
 	for {
 		select {
 		case <-readyCtx.Done():
-			return nil, fmt.Errorf("timeout waiting for inference job to be ready after %d checks", checkCount)
+			return nil, fmt.Errorf("timeout waiting for mindlet server to be ready after %d checks", checkCount)
 		case <-ticker.C:
 			checkCount++
 			job.mu.RLock()
@@ -415,7 +462,7 @@ func (m *OrchestrationManager) GetOrCreateInferenceSession(ctx context.Context, 
 			log.Printf("GetOrCreateSession check %d: status=%s, endpoint=%s", checkCount, status, endpoint)
 
 			if status == JobStatusError {
-				return nil, fmt.Errorf("inference job failed: %w", lastError)
+				return nil, fmt.Errorf("mindlet server failed to start: %w", lastError)
 			}
 
 			if status == JobStatusRunning && endpoint != "" {
@@ -425,16 +472,21 @@ func (m *OrchestrationManager) GetOrCreateInferenceSession(ctx context.Context, 
 				}
 
 				session := &InferenceSession{
-					ID:           job.ID,
-					ModelID:      modelID,
-					Status:       SessionStatusRunning,
-					Endpoint:     endpointURL,
-					Expiration:   job.Expiration,
-					IsPersistent: false,
-					httpClient:   &http.Client{Timeout: 60 * time.Second},
+					ID:             job.ID,
+					ModelID:        modelID,
+					CheckpointPath: modelPath, // Set the checkpoint path
+					ModelSize:      "8B",      // Default size, could be made configurable
+					Status:         SessionStatusRunning,
+					Endpoint:       endpointURL,
+					Expiration:     job.Expiration,
+					IsPersistent:   false,
+					httpClient:     &http.Client{Timeout: 60 * time.Second},
 				}
 
-				log.Printf("Created new session %s for model %s at %s after %d checks", job.ID, modelID, endpoint, checkCount)
+				log.Printf("Created new mindlet session %s for model %s at %s after %d checks", job.ID, modelID, endpoint, checkCount)
+				if modelPath != "" && modelPath != modelID {
+					log.Printf("Using checkpoint path: %s", modelPath)
+				}
 				return session, nil
 			}
 		}
@@ -472,19 +524,16 @@ func (m *OrchestrationManager) startInferenceProcess(ctx context.Context, job *O
 	job.StartedAt = &now
 	job.mu.Unlock()
 
-	// Build the command arguments
+	// Build the command arguments for mindlet inference
+	// Note: We're simplifying the config since mindlet handles model details internally
 	args := []string{
 		"mindlet", "inference",
-		"--dcp-dir", config.DCPDir,
-		"--tokenizer-path", config.TokenizerPath,
-		"--params-path", config.ParamsPath,
-		"--port", fmt.Sprintf("%d", config.Port),
-		"--dcp-model-size", config.DCPModelSize,
-		"--checkpoint-folder", config.CheckpointFolder,
 		"--node-count", fmt.Sprintf("%d", config.NodeCount),
 		"--skip-cluster-creation",
+		"--port", fmt.Sprintf("%d", config.Port),
 	}
 
+	// Only add mount paths if specified
 	if config.RaidMountPath != "" {
 		args = append(args, "--raid-mount-path", config.RaidMountPath)
 	}
@@ -492,23 +541,23 @@ func (m *OrchestrationManager) startInferenceProcess(ctx context.Context, job *O
 		args = append(args, "--raid-name", config.RaidName)
 	}
 
-	// Log the config being used
-	log.Printf("Starting inference with config:")
-	log.Printf("  DCPDir: %s", config.DCPDir)
-	log.Printf("  TokenizerPath: %s", config.TokenizerPath)
-	log.Printf("  ParamsPath: %s", config.ParamsPath)
+	// Log the simplified config being used
+	log.Printf("Starting mindlet inference server:")
 	log.Printf("  Port: %d", config.Port)
-	log.Printf("  DCPModelSize: %s", config.DCPModelSize)
-	log.Printf("  CheckpointFolder: %s", config.CheckpointFolder)
-	log.Printf("  RaidMountPath: %s", config.RaidMountPath)
-	log.Printf("  RaidName: %s", config.RaidName)
+	log.Printf("  NodeCount: %d", config.NodeCount)
+	if config.RaidMountPath != "" {
+		log.Printf("  RaidMountPath: %s", config.RaidMountPath)
+	}
+	if config.RaidName != "" {
+		log.Printf("  RaidName: %s", config.RaidName)
+	}
 
 	// Execute the command
 	output, err := m.executeOrchestrationCommand(ctx, args...)
 	if err != nil {
 		job.mu.Lock()
 		job.Status = JobStatusError
-		job.LastError = fmt.Errorf("failed to start inference: %w\nOutput: %s", err, string(output))
+		job.LastError = fmt.Errorf("failed to start mindlet server: %w\nOutput: %s", err, string(output))
 		job.mu.Unlock()
 		return job.LastError
 	}
@@ -517,7 +566,7 @@ func (m *OrchestrationManager) startInferenceProcess(ctx context.Context, job *O
 	readyCtx, cancel := context.WithTimeout(ctx, 6*time.Minute)
 	defer cancel()
 
-	log.Printf("Waiting for inference server to be ready (job %s)...", job.ID)
+	log.Printf("Waiting for mindlet server to be ready (job %s)...", job.ID)
 
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -528,7 +577,7 @@ func (m *OrchestrationManager) startInferenceProcess(ctx context.Context, job *O
 		case <-readyCtx.Done():
 			job.mu.Lock()
 			job.Status = JobStatusError
-			job.LastError = fmt.Errorf("timeout waiting for inference server to be ready after %d checks", checkCount)
+			job.LastError = fmt.Errorf("timeout waiting for mindlet server to be ready after %d checks", checkCount)
 			job.mu.Unlock()
 			return job.LastError
 
@@ -536,9 +585,9 @@ func (m *OrchestrationManager) startInferenceProcess(ctx context.Context, job *O
 			checkCount++
 			status, err := m.checkInferenceStatus(ctx)
 			if err != nil {
-				log.Printf("Check %d: Error checking inference status: %v", checkCount, err)
+				log.Printf("Check %d: Error checking mindlet status: %v", checkCount, err)
 			} else {
-				log.Printf("Check %d: Inference status: %+v", checkCount, status)
+				log.Printf("Check %d: Mindlet status: %+v", checkCount, status)
 				if serverStatus, ok := status["status"].(string); ok && serverStatus == "healthy" {
 					// Server is ready
 					job.mu.Lock()
@@ -548,7 +597,7 @@ func (m *OrchestrationManager) startInferenceProcess(ctx context.Context, job *O
 					}
 					job.mu.Unlock()
 
-					log.Printf("Inference job %s started successfully after %d checks", job.ID, checkCount)
+					log.Printf("Mindlet server for job %s started successfully after %d checks", job.ID, checkCount)
 					return nil
 				}
 			}
@@ -626,4 +675,123 @@ func (m *OrchestrationManager) checkExpirations() {
 			cancel()
 		}
 	}
+}
+
+// Add training process starter
+func (m *OrchestrationManager) startTrainingProcess(ctx context.Context, job *OrchestrationJob) error {
+	job.mu.Lock()
+	job.Status = JobStatusInitializing
+	now := time.Now()
+	job.StartedAt = &now
+	job.mu.Unlock()
+
+	// Extract config
+	sourceModelID := job.Config["source_model_id"].(string)
+	targetModelID := job.Config["target_model_id"].(string)
+	checkpointPath := job.Config["checkpoint_path"].(string)
+	outputPath := job.Config["output_path"].(string)
+	datasetPath := job.Config["dataset_path"].(string)
+	learningRate := job.Config["learning_rate"].(float64)
+	batchSize := job.Config["batch_size"].(int)
+	numEpochs := job.Config["num_epochs"].(int)
+
+	// Build command arguments for training
+	args := []string{
+		"mindlet", "training",
+		"--source-model-id", sourceModelID,
+		"--target-model-id", targetModelID,
+		"--checkpoint-path", checkpointPath,
+		"--output-path", outputPath,
+		"--dataset-path", datasetPath,
+		"--learning-rate", fmt.Sprintf("%f", learningRate),
+		"--batch-size", fmt.Sprintf("%d", batchSize),
+		"--num-epochs", fmt.Sprintf("%d", numEpochs),
+		"--job-id", job.ID,
+		"--skip-cluster-creation",
+	}
+
+	// Execute the training command
+	output, err := m.executeOrchestrationCommand(ctx, args...)
+	if err != nil {
+		job.mu.Lock()
+		job.Status = JobStatusError
+		job.LastError = fmt.Errorf("failed to start training: %w\nOutput: %s", err, string(output))
+		job.mu.Unlock()
+		return job.LastError
+	}
+
+	// Training started successfully
+	job.mu.Lock()
+	job.Status = JobStatusRunning
+	job.mu.Unlock()
+
+	log.Printf("Training job %s started successfully", job.ID)
+
+	// Monitor training progress in a separate goroutine
+	go m.monitorTrainingProgress(job)
+
+	return nil
+}
+
+// Add training progress monitor
+func (m *OrchestrationManager) monitorTrainingProgress(job *OrchestrationJob) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// Check training status
+			status, err := m.checkTrainingStatus(context.Background(), job.ID)
+			if err != nil {
+				log.Printf("Error checking training status for job %s: %v", job.ID, err)
+				continue
+			}
+
+			job.mu.Lock()
+			// Update job with latest status
+			if statusStr, ok := status["status"].(string); ok {
+				if statusStr == "completed" {
+					job.Status = JobStatusStopped
+					now := time.Now()
+					job.StoppedAt = &now
+					job.mu.Unlock()
+					log.Printf("Training job %s completed", job.ID)
+					return
+				} else if statusStr == "error" {
+					job.Status = JobStatusError
+					if errMsg, ok := status["error"].(string); ok {
+						job.LastError = fmt.Errorf(errMsg)
+					}
+					now := time.Now()
+					job.StoppedAt = &now
+					job.mu.Unlock()
+					log.Printf("Training job %s failed", job.ID)
+					return
+				}
+			}
+			job.mu.Unlock()
+		}
+	}
+}
+
+// Add training status checker
+func (m *OrchestrationManager) checkTrainingStatus(ctx context.Context, jobID string) (map[string]interface{}, error) {
+	args := []string{
+		"mindlet", "training", "status",
+		"--job-id", jobID,
+		"--skip-cluster-creation",
+	}
+
+	output, err := m.executeOrchestrationCommand(ctx, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get training status: %w", err)
+	}
+
+	var status map[string]interface{}
+	if err := json.Unmarshal(output, &status); err != nil {
+		return nil, fmt.Errorf("failed to parse training status: %w", err)
+	}
+
+	return status, nil
 }

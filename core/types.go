@@ -22,10 +22,12 @@ type ResponseType string
 type ResponseStatus string
 
 const (
-	RequestTypeInference RequestType = "INFERENCE"
-	RequestTypeSetUser   RequestType = "SET_USER"
-	RequestTypeSession   RequestType = "SESSION"
-	RequestTypeJobStatus RequestType = "JOB_STATUS"
+	RequestTypeInference      RequestType = "INFERENCE"
+	RequestTypeSetUser        RequestType = "SET_USER"
+	RequestTypeSession        RequestType = "SESSION"
+	RequestTypeJobStatus      RequestType = "JOB_STATUS"
+	RequestTypeTraining       RequestType = "TRAINING"
+	RequestTypeTrainingStatus RequestType = "TRAINING_STATUS"
 
 	RequestStatusPending    RequestStatus = "PENDING"
 	RequestStatusAllocated  RequestStatus = "ALLOCATED"
@@ -88,9 +90,10 @@ type WrappedResponse struct {
 
 // Request implementations
 type InferenceRequest struct {
-	UserID   db.Digest `json:"user_id"`
-	ModelID  string    `json:"model_id"`
-	Messages []Message `json:"messages"`
+	UserID         db.Digest `json:"user_id"`
+	ModelID        string    `json:"model_id"`
+	Messages       []Message `json:"messages"`
+	CheckpointPath string    `json:"checkpoint_path,omitempty"`
 }
 
 func (r *InferenceRequest) NexusRequestType() RequestType {
@@ -187,6 +190,53 @@ type JobStatusInfo struct {
 	Expiration time.Time              `json:"expiration"`
 	Endpoint   string                 `json:"endpoint,omitempty"`
 	LiveStatus map[string]interface{} `json:"live_status,omitempty"`
+}
+
+type TrainingRequest struct {
+	JobID          string    `json:"job_id"`
+	UserID         db.Digest `json:"user_id"`
+	SourceModelID  string    `json:"source_model_id"` // Model name
+	TargetModelID  string    `json:"target_model_id"` // New model name
+	CheckpointPath string    `json:"checkpoint_path"`
+	OutputPath     string    `json:"output_path"`
+	DatasetPath    string    `json:"dataset_path"`
+	LearningRate   float64   `json:"learning_rate"`
+	BatchSize      int       `json:"batch_size"`
+	NumEpochs      int       `json:"num_epochs"`
+}
+
+func (r *TrainingRequest) NexusRequestType() RequestType {
+	return RequestTypeTraining
+}
+
+type TrainingResponse struct {
+	JobID  string `json:"job_id"`
+	Status string `json:"status"`
+}
+
+func (r *TrainingResponse) NexusResponseType() RequestType {
+	return RequestTypeTraining
+}
+
+type TrainingStatusRequest struct {
+	JobID string `json:"job_id"`
+}
+
+func (r *TrainingStatusRequest) NexusRequestType() RequestType {
+	return RequestTypeTrainingStatus
+}
+
+type TrainingStatusResponse struct {
+	JobID       string     `json:"job_id"`
+	Status      string     `json:"status"`
+	Progress    float64    `json:"progress"`
+	Error       string     `json:"error,omitempty"`
+	StartedAt   time.Time  `json:"started_at"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
+}
+
+func (r *TrainingStatusResponse) NexusResponseType() RequestType {
+	return RequestTypeTrainingStatus
 }
 
 type Message struct {
@@ -298,6 +348,34 @@ func UnwrapRequest(wrapped *WrappedRequest, connID string) (*Request, error) {
 			ConnectionID: connID,
 			Status:       RequestStatusPending,
 			Data:         &jobReq,
+			CreatedAt:    time.Now(),
+		}, nil
+
+	case RequestTypeTraining:
+		var trainReq TrainingRequest
+		if err := json.Unmarshal(wrapped.Data, &trainReq); err != nil {
+			return nil, err
+		}
+		return &Request{
+			RequestID:    wrapped.RequestID,
+			Type:         RequestTypeTraining,
+			ConnectionID: connID,
+			Status:       RequestStatusPending,
+			Data:         &trainReq,
+			CreatedAt:    time.Now(),
+		}, nil
+
+	case RequestTypeTrainingStatus:
+		var statusReq TrainingStatusRequest
+		if err := json.Unmarshal(wrapped.Data, &statusReq); err != nil {
+			return nil, err
+		}
+		return &Request{
+			RequestID:    wrapped.RequestID,
+			Type:         RequestTypeTrainingStatus,
+			ConnectionID: connID,
+			Status:       RequestStatusPending,
+			Data:         &statusReq,
 			CreatedAt:    time.Now(),
 		}, nil
 	}
