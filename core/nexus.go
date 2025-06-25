@@ -242,7 +242,7 @@ func (n *Nexus) handleInference(req *Request) error {
 		log.Printf("Using checkpoint path from request: %s", modelPath)
 	} else {
 		// Fallback for base models that don't have checkpoint path in request
-		modelPath = fmt.Sprintf("/mnt/cold-storage/contents/dcp/%s", inferReq.ModelID)
+		modelPath = fmt.Sprintf("/mnt/cold/contents/dcp/%s", inferReq.ModelID)
 		log.Printf("Using default model path: %s", modelPath)
 	}
 
