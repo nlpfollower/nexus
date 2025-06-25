@@ -427,7 +427,7 @@ func (m *OrchestrationManager) GetOrCreateInferenceSession(ctx context.Context, 
 		Port:          9090, // Default mindlet port
 		NodeCount:     1,
 		RaidMountPath: "/mnt/cold",
-		RaidName:      "cold",
+		RaidName:      "cold-new",
 	}
 
 	job, err := m.StartInferenceJob(ctx, modelID, config)

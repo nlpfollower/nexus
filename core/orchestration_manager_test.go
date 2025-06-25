@@ -97,7 +97,7 @@ func TestOrchestrationManager_MindletInference(t *testing.T) {
 		Port:          9090,
 		NodeCount:     1,
 		RaidMountPath: "/mnt/cold",
-		RaidName:      "cold",
+		RaidName:      "cold-new",
 	}
 
 	t.Log("Starting mindlet server...")
