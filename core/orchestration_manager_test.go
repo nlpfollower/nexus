@@ -4,7 +4,6 @@ package core
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -179,17 +178,12 @@ func testMindletInference(t *testing.T, endpoint, modelID, modelSize string) err
 		{Role: "user", Content: fmt.Sprintf("You are model %s. Say 'I am %s' and nothing else.", modelID, modelID)},
 	}
 
-	// Create a mock session to test the endpoint
-	session := &InferenceSession{
-		ID:             "test-session",
-		ModelID:        modelID,
-		CheckpointPath: checkpointPath,
-		ModelSize:      modelSize,
-		Status:         SessionStatusRunning,
-		Endpoint:       parseEndpoint(endpoint),
-		Expiration:     time.Now().Add(5 * time.Minute),
-		httpClient:     createHTTPClient(),
-	}
+	// Create a session using the constructor
+	session := NewInferenceSession("test-session", modelID, 5*time.Minute, false)
+	session.SetCheckpointPath(checkpointPath)
+	session.SetModelSize(modelSize)
+	session.Status = SessionStatusRunning
+	session.Endpoint = parseEndpoint(endpoint)
 
 	// Process inference using the session
 	ctx := context.Background()
@@ -401,15 +395,4 @@ func TestOrchestrationManager_Expiration(t *testing.T) {
 func parseEndpoint(endpoint string) *url.URL {
 	u, _ := url.Parse(endpoint)
 	return u
-}
-
-func createHTTPClient() *http.Client {
-	return &http.Client{
-		Timeout: 60 * time.Second,
-		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 100,
-			IdleConnTimeout:     90 * time.Second,
-		},
-	}
 }

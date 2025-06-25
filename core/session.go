@@ -65,7 +65,7 @@ func NewInferenceSession(id string, modelID string, maxIdleTime time.Duration, i
 		Expiration:   time.Now().Add(maxIdleTime),
 		IsPersistent: isPersistent,
 		httpClient: &http.Client{
-			Timeout: 60 * time.Second,
+			Timeout: 10 * time.Minute,
 			Transport: &http.Transport{
 				MaxIdleConns:        100,
 				MaxIdleConnsPerHost: 100,

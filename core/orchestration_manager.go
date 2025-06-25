@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -400,24 +399,19 @@ func (m *OrchestrationManager) GetOrCreateInferenceSession(ctx context.Context, 
 		job.mu.RUnlock()
 
 		if isRunning && endpoint != "" {
-			// Create a session wrapper for this job
+			// Parse the endpoint URL
 			endpointURL, err := url.Parse(endpoint)
 			if err != nil {
 				continue
 			}
 
 			// The mindlet server can handle multiple models, so we can reuse it
-			session := &InferenceSession{
-				ID:             jobID,
-				ModelID:        modelID,
-				CheckpointPath: modelPath, // Set the checkpoint path
-				ModelSize:      "8B",      // Default size, could be made configurable
-				Status:         SessionStatusRunning,
-				Endpoint:       endpointURL,
-				Expiration:     expiration,
-				IsPersistent:   false,
-				httpClient:     &http.Client{Timeout: 60 * time.Second},
-			}
+			session := NewInferenceSession(jobID, modelID, time.Until(expiration), false)
+			session.SetCheckpointPath(modelPath)
+			session.SetModelSize("8B") // Default size, could be made configurable
+			session.Status = SessionStatusRunning
+			session.Endpoint = endpointURL
+			session.Expiration = expiration
 
 			log.Printf("Reusing existing mindlet session %s for model %s at %s", jobID, modelID, endpoint)
 			if modelPath != "" && modelPath != modelID {
@@ -473,17 +467,12 @@ func (m *OrchestrationManager) GetOrCreateInferenceSession(ctx context.Context, 
 					return nil, fmt.Errorf("invalid endpoint URL: %w", err)
 				}
 
-				session := &InferenceSession{
-					ID:             job.ID,
-					ModelID:        modelID,
-					CheckpointPath: modelPath, // Set the checkpoint path
-					ModelSize:      "8B",      // Default size, could be made configurable
-					Status:         SessionStatusRunning,
-					Endpoint:       endpointURL,
-					Expiration:     job.Expiration,
-					IsPersistent:   false,
-					httpClient:     &http.Client{Timeout: 60 * time.Second},
-				}
+				session := NewInferenceSession(job.ID, modelID, time.Until(job.Expiration), false)
+				session.SetCheckpointPath(modelPath)
+				session.SetModelSize("8B") // Default size, could be made configurable
+				session.Status = SessionStatusRunning
+				session.Endpoint = endpointURL
+				session.Expiration = job.Expiration
 
 				log.Printf("Created new mindlet session %s for model %s at %s after %d checks", job.ID, modelID, endpoint, checkCount)
 				if modelPath != "" && modelPath != modelID {
