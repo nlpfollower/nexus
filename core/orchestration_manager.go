@@ -2,6 +2,8 @@
 package core
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -502,19 +504,70 @@ func (m *OrchestrationManager) executeOrchestrationCommand(ctx context.Context, 
 	// Log the full command
 	log.Printf("Executing command in %s: go %s", m.orchestrationDir, strings.Join(fullArgs, " "))
 
-	// Capture both stdout and stderr
-	output, err := cmd.CombinedOutput()
-
-	// Always log the output, even on success
-	if len(output) > 0 {
-		log.Printf("Command output:\n%s", string(output))
-	}
-
+	// Create pipes for both stdout and stderr
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		log.Printf("Command failed with error: %v", err)
+		return nil, fmt.Errorf("failed to create stdout pipe: %w", err)
 	}
 
-	return output, err
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create stderr pipe: %w", err)
+	}
+
+	// Start the command
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("failed to start command: %w", err)
+	}
+
+	// Capture output while streaming
+	var outputBuffer bytes.Buffer
+	var errorBuffer bytes.Buffer
+
+	// Create a wait group for the goroutines
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Stream stdout
+	go func() {
+		defer wg.Done()
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			line := scanner.Text()
+			log.Printf("[orchestration stdout] %s", line)
+			outputBuffer.WriteString(line + "\n")
+		}
+	}()
+
+	// Stream stderr
+	go func() {
+		defer wg.Done()
+		scanner := bufio.NewScanner(stderr)
+		for scanner.Scan() {
+			line := scanner.Text()
+			log.Printf("[orchestration stderr] %s", line)
+			errorBuffer.WriteString(line + "\n")
+		}
+	}()
+
+	// Wait for command to complete
+	cmdErr := cmd.Wait()
+
+	// Wait for all output to be captured
+	wg.Wait()
+
+	// Combine stdout and stderr
+	combinedOutput := outputBuffer.Bytes()
+	if errorBuffer.Len() > 0 {
+		combinedOutput = append(combinedOutput, errorBuffer.Bytes()...)
+	}
+
+	if cmdErr != nil {
+		log.Printf("Command failed with error: %v", cmdErr)
+		return combinedOutput, cmdErr
+	}
+
+	return combinedOutput, nil
 }
 
 func (m *OrchestrationManager) startInferenceProcess(ctx context.Context, job *OrchestrationJob, config InferenceConfig) error {
