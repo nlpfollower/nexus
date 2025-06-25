@@ -291,7 +291,7 @@ func TestOrchestrationManager_ClonedModel(t *testing.T) {
 	// Test with a cloned model scenario
 	// Model ID is different from checkpoint path
 	clonedModelID := "my-custom-llama-8b"
-	originalCheckpointPath := "/mnt/cold/contents/dcp/llama-8b"
+	originalCheckpointPath := "/mnt/cold/contents/dcp/llama-8b/checkpoint"
 
 	// Start inference session with cloned model
 	session, err := manager.GetOrCreateInferenceSession(ctx, clonedModelID, originalCheckpointPath)
