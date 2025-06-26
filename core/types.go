@@ -94,6 +94,7 @@ type InferenceRequest struct {
 	ModelID        string    `json:"model_id"`
 	Messages       []Message `json:"messages"`
 	CheckpointPath string    `json:"checkpoint_path,omitempty"`
+	ModelSize      string    `json:"model_size,omitempty"` // NEW: Model size (3B, 8B, 70B, etc.)
 }
 
 func (r *InferenceRequest) NexusRequestType() RequestType {

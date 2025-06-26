@@ -255,6 +255,12 @@ func (n *Nexus) handleInference(req *Request) error {
 		return fmt.Errorf("failed to get/create inference session: %w", err)
 	}
 
+	// Set model size on the session if provided
+	if inferReq.ModelSize != "" {
+		session.SetModelSize(inferReq.ModelSize)
+		log.Printf("Set model size to %s for session %s", inferReq.ModelSize, session.ID)
+	}
+
 	// Process the inference request with a fresh context
 	inferenceCtx := context.Background()
 	stream, err := session.ProcessInference(inferenceCtx, inferReq.Messages)
@@ -306,15 +312,10 @@ func (n *Nexus) handleSessionRequest(req *Request) error {
 	case SessionActionStart:
 		// Start a new inference job
 		config := InferenceConfig{
-			DCPDir:           fmt.Sprintf("/mnt/cold/contents/dcp/%s/step-0", sessionReq.ModelID),
-			TokenizerPath:    "/mnt/cold/contents/checkpoints/Llama3.1-8B-Instruct/tokenizer.model",
-			ParamsPath:       "torchchat/model_params/Meta-Llama-3.1-8B.json",
-			Port:             5000,
-			DCPModelSize:     "8B",
-			CheckpointFolder: sessionReq.ModelID,
-			NodeCount:        1,
-			RaidMountPath:    "/mnt/cold",
-			RaidName:         "cold-new",
+			Port:          9090, // Default mindlet port
+			NodeCount:     1,
+			RaidMountPath: "/mnt/cold",
+			RaidName:      "cold-new",
 		}
 
 		job, err := n.orchestrationMgr.StartInferenceJob(ctx, sessionReq.ModelID, config)
