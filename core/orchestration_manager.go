@@ -936,7 +936,7 @@ func (m *OrchestrationManager) monitorTrainingProgress(job *OrchestrationJob) {
 func (m *OrchestrationManager) checkTrainingStatus(ctx context.Context, jobID string) (map[string]interface{}, error) {
 	args := []string{
 		"mindlet", "train", "status",
-		"--skip-cluster-creation",
+		"--skip-cluster-creation", "--silent-mode",
 	}
 
 	log.Printf("Checking training status for job %s", jobID)
