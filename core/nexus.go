@@ -1,4 +1,3 @@
-// core/nexus.go
 package core
 
 import (
@@ -28,6 +27,7 @@ type Nexus struct {
 	apiManager       *APIModelManager
 	orchestrationMgr *OrchestrationManager
 	connManager      *ConnectionManager
+	trainingMgr      *TrainingManager
 
 	// Add generation tracking
 	// key is requestID.String()
@@ -60,6 +60,9 @@ func NewNexus(cfg *Config) (*Nexus, error) {
 		activeGenerations: utils.NewConcurrentMap[string, *activeGeneration](),
 		done:              make(chan struct{}),
 	}
+
+	// Create training manager without nexus back reference
+	nexus.trainingMgr = NewTrainingManager(orchestrationMgr)
 
 	// Create connection manager with closure callback
 	nexus.connManager = NewConnectionManager(
@@ -105,6 +108,11 @@ func (n *Nexus) Stop() {
 		for _, gen := range n.activeGenerations.GetAll() {
 			gen.stream.Stop()
 		}
+
+		// Stop all training jobs
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		n.trainingMgr.StopAllJobs(ctx)
+		cancel()
 
 		// CRITICAL: Stop all running jobs before shutdown
 		log.Printf("Stopping all running jobs for clean shutdown...")
@@ -564,32 +572,16 @@ func (n *Nexus) handleTraining(req *Request) error {
 		return fmt.Errorf("invalid training request data")
 	}
 
-	// TODO: Create training configuration
-	trainingConfig := map[string]interface{}{
-		"source_model_id": trainReq.SourceModelID,
-		"target_model_id": trainReq.TargetModelID,
-		"checkpoint_path": trainReq.CheckpointPath,
-		"output_path":     trainReq.OutputPath,
-		"dataset_path":    trainReq.DatasetPath,
-		"learning_rate":   trainReq.LearningRate,
-		"batch_size":      trainReq.BatchSize,
-		"num_epochs":      trainReq.NumEpochs,
-	}
-
-	// Start training job via orchestration manager
-	job, err := n.orchestrationMgr.StartTrainingJob(
-		context.Background(),
-		trainReq.TargetModelID,
-		trainingConfig,
-	)
+	// Start the training job via training manager
+	trainingJob, err := n.trainingMgr.StartTraining(context.Background(), trainReq)
 	if err != nil {
-		return fmt.Errorf("failed to start training job: %w", err)
+		return fmt.Errorf("failed to start training: %w", err)
 	}
 
 	// Send initial response
 	resp := &TrainingResponse{
-		JobID:  job.ID,
-		Status: string(job.Status),
+		JobID:  trainReq.JobID,
+		Status: trainingJob.Status,
 	}
 	n.sendWrappedResponse(req, resp)
 	return nil
@@ -602,32 +594,20 @@ func (n *Nexus) handleTrainingStatus(req *Request) error {
 		return fmt.Errorf("invalid training status request data")
 	}
 
-	// Get job info from orchestration manager
-	jobInfo, err := n.orchestrationMgr.GetJobStatus(context.Background(), statusReq.JobID)
+	// Get job status from training manager
+	job, err := n.trainingMgr.GetJobStatus(statusReq.JobID)
 	if err != nil {
-		return fmt.Errorf("failed to get job status: %w", err)
+		return fmt.Errorf("failed to get training status: %w", err)
 	}
 
 	// Convert to training status response
 	resp := &TrainingStatusResponse{
-		JobID:  jobInfo.ID,
-		Status: string(jobInfo.Status),
-		// Progress would need to be extracted from LiveStatus or job metadata
-		Progress: 0.0, // TODO: Get actual progress from job
-	}
-
-	if jobInfo.StartedAt != nil {
-		resp.StartedAt = *jobInfo.StartedAt
-	}
-	if jobInfo.StoppedAt != nil {
-		resp.CompletedAt = jobInfo.StoppedAt
-	}
-
-	// Check for errors
-	if jobInfo.Status == JobStatusError {
-		if errorMsg, ok := jobInfo.LiveStatus["error"].(string); ok {
-			resp.Error = errorMsg
-		}
+		JobID:       job.JobID,
+		Status:      job.Status,
+		Progress:    job.Progress,
+		Error:       job.Error,
+		StartedAt:   job.StartedAt,
+		CompletedAt: job.CompletedAt,
 	}
 
 	n.sendWrappedResponse(req, resp)

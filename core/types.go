@@ -1,4 +1,3 @@
-// core/types.go
 package core
 
 import (
@@ -94,7 +93,7 @@ type InferenceRequest struct {
 	ModelID        string    `json:"model_id"`
 	Messages       []Message `json:"messages"`
 	CheckpointPath string    `json:"checkpoint_path,omitempty"`
-	ModelSize      string    `json:"model_size,omitempty"` // NEW: Model size (3B, 8B, 70B, etc.)
+	ModelSize      string    `json:"model_size,omitempty"` // Model size (3B, 8B, 70B, etc.)
 }
 
 func (r *InferenceRequest) NexusRequestType() RequestType {
@@ -200,7 +199,8 @@ type TrainingRequest struct {
 	TargetModelID  string    `json:"target_model_id"` // New model name
 	CheckpointPath string    `json:"checkpoint_path"`
 	OutputPath     string    `json:"output_path"`
-	DatasetPath    string    `json:"dataset_path"`
+	Dataset        string    `json:"dataset"`
+	ModelSize      string    `json:"model_size"` // "8B", "70B", etc.
 	LearningRate   float64   `json:"learning_rate"`
 	BatchSize      int       `json:"batch_size"`
 	NumEpochs      int       `json:"num_epochs"`

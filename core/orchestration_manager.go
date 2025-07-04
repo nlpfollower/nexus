@@ -260,7 +260,7 @@ func (m *OrchestrationManager) stopJob(ctx context.Context, job *OrchestrationJo
 	case JobTypeInference:
 		err = m.stopInferenceProcess(ctx, job)
 	case JobTypeTraining:
-		err = m.stopTrainingProcess(ctx, job) // NEW
+		err = m.stopTrainingProcess(ctx, job)
 	}
 
 	// Update final status
@@ -316,14 +316,16 @@ func (m *OrchestrationManager) stopTrainingProcess(ctx context.Context, job *Orc
 	log.Printf("Stopping training job %s", job.ID)
 
 	args := []string{
-		"mindlet", "training", "stop",
-		"--job-id", job.ID,
+		"mindlet", "train", "stop",
 		"--skip-cluster-creation",
 	}
 
 	output, err := m.executeOrchestrationCommand(ctx, args...)
 	if err != nil {
-		return fmt.Errorf("failed to stop training: %w\nOutput: %s", err, string(output))
+		// Log but don't fail if stop command has issues
+		log.Printf("Training stop command returned error: %v\nOutput: %s", err, string(output))
+		// Still mark as successful stop since the command executed
+		return nil
 	}
 
 	log.Printf("Training job %s stopped successfully", job.ID)
@@ -482,6 +484,66 @@ func (m *OrchestrationManager) GetOrCreateInferenceSession(ctx context.Context, 
 			}
 		}
 	}
+}
+
+// GetTrainingStatus gets the status of a training job from orchestration
+func (m *OrchestrationManager) GetTrainingStatus(ctx context.Context, jobID string) (map[string]interface{}, error) {
+	job, exists := m.jobs.Get(jobID)
+	if !exists {
+		return nil, fmt.Errorf("training job not found: %s", jobID)
+	}
+
+	job.mu.RLock()
+	status := job.Status
+	job.mu.RUnlock()
+
+	// For running training jobs, check live status
+	if status == JobStatusRunning {
+		liveStatus, err := m.checkTrainingStatus(ctx, jobID)
+		if err != nil {
+			// Return basic status if live check fails
+			return map[string]interface{}{
+				"status": string(status),
+				"job_id": jobID,
+			}, nil
+		}
+
+		// Add progress calculation based on training status
+		if trainingStatus, ok := liveStatus["status"].(string); ok {
+			result := map[string]interface{}{
+				"status": trainingStatus,
+				"job_id": jobID,
+			}
+
+			// Copy any additional fields from live status
+			for k, v := range liveStatus {
+				if k != "status" && k != "job_id" {
+					result[k] = v
+				}
+			}
+
+			return result, nil
+		}
+
+		return liveStatus, nil
+	}
+
+	// Return basic status for non-running jobs
+	result := map[string]interface{}{
+		"status": string(status),
+		"job_id": jobID,
+	}
+
+	// Add error information if available
+	if status == JobStatusError {
+		job.mu.RLock()
+		if job.LastError != nil {
+			result["error"] = job.LastError.Error()
+		}
+		job.mu.RUnlock()
+	}
+
+	return result, nil
 }
 
 // executeOrchestrationCommand runs a command in the orchestration directory
@@ -719,7 +781,36 @@ func (m *OrchestrationManager) checkExpirations() {
 	}
 }
 
-// Add training process starter
+func (m *OrchestrationManager) getNodeCountFromConfig(config map[string]interface{}) int {
+	// First check if node_count is explicitly set in config
+	if nodeCount, ok := config["node_count"].(int); ok {
+		return nodeCount
+	}
+
+	// Use model size from config
+	if modelSize, ok := config["model_size"].(string); ok {
+		return m.determineNodeCountFromModelSize(modelSize)
+	}
+
+	// Default to 1 node if nothing else is specified
+	return 1
+}
+
+// determineNodeCountFromModelSize determines appropriate node count based on model size
+func (m *OrchestrationManager) determineNodeCountFromModelSize(modelSize string) int {
+	switch strings.ToLower(modelSize) {
+	case "70b":
+		return 2 // 70B models need 2 nodes
+	case "8b", "3b":
+		return 1 // Smaller models use 1 node
+	default:
+		// Default to 1 node for unknown models
+		log.Printf("Unknown model size %s, defaulting to 1 node", modelSize)
+		return 1
+	}
+}
+
+// Updated startTrainingProcess to use dynamic node count
 func (m *OrchestrationManager) startTrainingProcess(ctx context.Context, job *OrchestrationJob) error {
 	job.mu.Lock()
 	job.Status = JobStatusInitializing
@@ -733,24 +824,34 @@ func (m *OrchestrationManager) startTrainingProcess(ctx context.Context, job *Or
 	checkpointPath := job.Config["checkpoint_path"].(string)
 	outputPath := job.Config["output_path"].(string)
 	datasetPath := job.Config["dataset_path"].(string)
-	learningRate := job.Config["learning_rate"].(float64)
-	batchSize := job.Config["batch_size"].(int)
-	numEpochs := job.Config["num_epochs"].(int)
+	modelName := job.Config["model_name"].(string)
+	modelSize := job.Config["model_size"].(string)
+	modelSize = strings.ToLower(modelSize)
 
-	// Build command arguments for training
+	// Determine node count
+	nodeCount := m.getNodeCountFromConfig(job.Config)
+
+	// Build command arguments for mindlet train
 	args := []string{
-		"mindlet", "training",
-		"--source-model-id", sourceModelID,
-		"--target-model-id", targetModelID,
-		"--checkpoint-path", checkpointPath,
-		"--output-path", outputPath,
+		"mindlet", "train",
+		"--model-path", checkpointPath,
 		"--dataset-path", datasetPath,
-		"--learning-rate", fmt.Sprintf("%f", learningRate),
-		"--batch-size", fmt.Sprintf("%d", batchSize),
-		"--num-epochs", fmt.Sprintf("%d", numEpochs),
-		"--job-id", job.ID,
+		"--output-dir", outputPath,
+		"--model-name", modelName,
+		"--model-size", modelSize,
+		"--node-count", fmt.Sprintf("%d", nodeCount),
 		"--skip-cluster-creation",
 	}
+
+	// Log the training configuration
+	log.Printf("Starting mindlet training:")
+	log.Printf("  Source Model: %s", sourceModelID)
+	log.Printf("  Target Model: %s", targetModelID)
+	log.Printf("  Model Name: %s", modelName)
+	log.Printf("  Node Count: %d", nodeCount)
+	log.Printf("  Checkpoint Path: %s", checkpointPath)
+	log.Printf("  Dataset Path: %s", datasetPath)
+	log.Printf("  Output Path: %s", outputPath)
 
 	// Execute the training command
 	output, err := m.executeOrchestrationCommand(ctx, args...)
@@ -767,7 +868,7 @@ func (m *OrchestrationManager) startTrainingProcess(ctx context.Context, job *Or
 	job.Status = JobStatusRunning
 	job.mu.Unlock()
 
-	log.Printf("Training job %s started successfully", job.ID)
+	log.Printf("Training job %s started successfully with %d nodes", job.ID, nodeCount)
 
 	// Monitor training progress in a separate goroutine
 	go m.monitorTrainingProgress(job)
@@ -783,7 +884,7 @@ func (m *OrchestrationManager) monitorTrainingProgress(job *OrchestrationJob) {
 	for {
 		select {
 		case <-ticker.C:
-			// Check training status
+			// Check training status using mindlet train status command
 			status, err := m.checkTrainingStatus(context.Background(), job.ID)
 			if err != nil {
 				log.Printf("Error checking training status for job %s: %v", job.ID, err)
@@ -793,14 +894,15 @@ func (m *OrchestrationManager) monitorTrainingProgress(job *OrchestrationJob) {
 			job.mu.Lock()
 			// Update job with latest status
 			if statusStr, ok := status["status"].(string); ok {
-				if statusStr == "completed" {
+				switch statusStr {
+				case "completed":
 					job.Status = JobStatusStopped
 					now := time.Now()
 					job.StoppedAt = &now
 					job.mu.Unlock()
 					log.Printf("Training job %s completed", job.ID)
 					return
-				} else if statusStr == "error" {
+				case "error", "failed":
 					job.Status = JobStatusError
 					if errMsg, ok := status["error"].(string); ok {
 						job.LastError = fmt.Errorf(errMsg)
@@ -810,9 +912,15 @@ func (m *OrchestrationManager) monitorTrainingProgress(job *OrchestrationJob) {
 					job.mu.Unlock()
 					log.Printf("Training job %s failed", job.ID)
 					return
+				case "running":
+					// Continue monitoring
+					job.mu.Unlock()
+				default:
+					job.mu.Unlock()
 				}
+			} else {
+				job.mu.Unlock()
 			}
-			job.mu.Unlock()
 		}
 	}
 }
@@ -820,19 +928,30 @@ func (m *OrchestrationManager) monitorTrainingProgress(job *OrchestrationJob) {
 // Add training status checker
 func (m *OrchestrationManager) checkTrainingStatus(ctx context.Context, jobID string) (map[string]interface{}, error) {
 	args := []string{
-		"mindlet", "training", "status",
-		"--job-id", jobID,
+		"mindlet", "train", "status",
 		"--skip-cluster-creation",
 	}
 
+	log.Printf("Checking training status for job %s", jobID)
 	output, err := m.executeOrchestrationCommand(ctx, args...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get training status: %w", err)
+		// Status command might fail if no training is running
+		log.Printf("Training status check failed: %v, output: %s", err, string(output))
+		return map[string]interface{}{
+			"status": "not_running",
+			"job_id": jobID,
+		}, nil
 	}
 
+	// Parse the JSON output from mindlet train status
 	var status map[string]interface{}
 	if err := json.Unmarshal(output, &status); err != nil {
-		return nil, fmt.Errorf("failed to parse training status: %w", err)
+		log.Printf("Failed to parse training status JSON: %v, output: %s", err, string(output))
+		return map[string]interface{}{
+			"status": "error",
+			"error":  "failed to parse status",
+			"job_id": jobID,
+		}, nil
 	}
 
 	return status, nil

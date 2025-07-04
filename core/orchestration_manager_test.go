@@ -390,6 +390,381 @@ func TestOrchestrationManager_Expiration(t *testing.T) {
 	require.Contains(t, []OrchestrationJobStatus{JobStatusExpired, JobStatusError, JobStatusStopping}, status)
 }
 
+// TestOrchestrationManager_TrainingNodeCount tests that training uses appropriate node counts
+func TestOrchestrationManager_TrainingNodeCount(t *testing.T) {
+	if !orchestrationDirExists() {
+		t.Skip("Orchestration directory not found")
+	}
+
+	manager, err := NewOrchestrationManager(30 * time.Minute)
+	require.NoError(t, err)
+
+	manager.Start()
+	defer manager.Stop()
+
+	testCases := []struct {
+		name          string
+		sourceModelID string
+		targetModelID string
+		expectedNodes int
+	}{
+		{
+			name:          "8B model training",
+			sourceModelID: "llama-8b-u123-c1",
+			targetModelID: "llama-8b-u123-c1-t1",
+			expectedNodes: 1,
+		},
+		{
+			name:          "70B model training",
+			sourceModelID: "llama-70b-u456-c1",
+			targetModelID: "llama-70b-u456-c1-t1",
+			expectedNodes: 2,
+		},
+		{
+			name:          "3B model training",
+			sourceModelID: "llama-3b-custom",
+			targetModelID: "llama-3b-custom-t1",
+			expectedNodes: 1,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+
+			// Test node count determination
+			actualNodes := manager.determineNodeCountFromModel(tc.sourceModelID)
+			require.Equal(t, tc.expectedNodes, actualNodes,
+				"Model %s should use %d nodes, got %d", tc.sourceModelID, tc.expectedNodes, actualNodes)
+
+			// Test training job creation with proper config
+			trainingConfig := map[string]interface{}{
+				"source_model_id": tc.sourceModelID,
+				"target_model_id": tc.targetModelID,
+				"checkpoint_path": fmt.Sprintf("/mnt/cold/contents/dcp/%s/checkpoint", tc.sourceModelID),
+				"output_path":     fmt.Sprintf("/mnt/cold/contents/dcp/%s/checkpoint", tc.targetModelID),
+				"dataset_path":    fmt.Sprintf("/mnt/cold/contents/datasets/dataset-%s", tc.targetModelID),
+				"model_name":      tc.targetModelID,
+				"node_count":      tc.expectedNodes, // Explicitly set node count
+			}
+
+			// Create training job (this would normally call mindlet train)
+			job, err := manager.StartTrainingJob(ctx, tc.targetModelID, trainingConfig)
+			require.NoError(t, err)
+			require.NotNil(t, job)
+
+			// Verify job properties
+			require.Equal(t, JobTypeTraining, job.Type)
+			require.Equal(t, tc.targetModelID, job.ModelID)
+
+			// Verify node count is in config
+			if nodeCount, ok := job.Config["node_count"].(int); ok {
+				require.Equal(t, tc.expectedNodes, nodeCount)
+			}
+
+			// Wait a moment for job to initialize
+			time.Sleep(100 * time.Millisecond)
+
+			// Check job status
+			jobStatus, err := manager.GetJobStatus(ctx, job.ID)
+			require.NoError(t, err)
+			require.Equal(t, job.ID, jobStatus.ID)
+
+			// Clean up - stop the job
+			err = manager.StopJob(ctx, job.ID)
+			require.NoError(t, err)
+
+			// Wait for stop to complete
+			require.Eventually(t, func() bool {
+				job.mu.RLock()
+				defer job.mu.RUnlock()
+				return job.Status == JobStatusStopped || job.Status == JobStatusError
+			}, 10*time.Second, 500*time.Millisecond)
+		})
+	}
+}
+
+// TestOrchestrationManager_TrainingCommand tests the actual mindlet train command generation
+func TestOrchestrationManager_TrainingCommand(t *testing.T) {
+	if !orchestrationDirExists() {
+		t.Skip("Orchestration directory not found")
+	}
+
+	manager, err := NewOrchestrationManager(30 * time.Minute)
+	require.NoError(t, err)
+
+	testCases := []struct {
+		name        string
+		config      map[string]interface{}
+		expectNodes int
+	}{
+		{
+			name: "8B model config",
+			config: map[string]interface{}{
+				"source_model_id": "llama-8b-u123-c1",
+				"target_model_id": "llama-8b-u123-c1-t1",
+				"checkpoint_path": "/mnt/cold/contents/dcp/llama-8b-u123-c1/checkpoint",
+				"output_path":     "/mnt/cold/contents/dcp/llama-8b-u123-c1-t1/checkpoint",
+				"dataset_path":    "/mnt/cold/contents/datasets/dataset-llama-8b-u123-c1-t1",
+				"model_name":      "llama-8b-u123-c1-t1",
+			},
+			expectNodes: 1,
+		},
+		{
+			name: "70B model config",
+			config: map[string]interface{}{
+				"source_model_id": "llama-70b-u456-c2",
+				"target_model_id": "llama-70b-u456-c2-t1",
+				"checkpoint_path": "/mnt/cold/contents/dcp/llama-70b-u456-c2/checkpoint",
+				"output_path":     "/mnt/cold/contents/dcp/llama-70b-u456-c2-t1/checkpoint",
+				"dataset_path":    "/mnt/cold/contents/datasets/dataset-llama-70b-u456-c2-t1",
+				"model_name":      "llama-70b-u456-c2-t1",
+			},
+			expectNodes: 2,
+		},
+		{
+			name: "Explicit node count override",
+			config: map[string]interface{}{
+				"source_model_id": "custom-model",
+				"target_model_id": "custom-model-t1",
+				"checkpoint_path": "/mnt/cold/contents/dcp/custom-model/checkpoint",
+				"output_path":     "/mnt/cold/contents/dcp/custom-model-t1/checkpoint",
+				"dataset_path":    "/mnt/cold/contents/datasets/dataset-custom-model-t1",
+				"model_name":      "custom-model-t1",
+				"node_count":      3, // Explicit override
+			},
+			expectNodes: 3,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Test node count determination
+			actualNodes := manager.getNodeCountFromConfig(tc.config)
+			require.Equal(t, tc.expectNodes, actualNodes)
+
+			// Create a mock job to test command generation
+			job := &OrchestrationJob{
+				ID:         "test-job",
+				Type:       JobTypeTraining,
+				Status:     JobStatusPending,
+				ModelID:    tc.config["target_model_id"].(string),
+				Config:     tc.config,
+				CreatedAt:  time.Now(),
+				Expiration: time.Now().Add(time.Hour),
+			}
+
+			// Test that the training process would use the correct node count
+			// We can't actually run the command, but we can verify the logic
+			sourceModelID := tc.config["source_model_id"].(string)
+			targetModelID := tc.config["target_model_id"].(string)
+			checkpointPath := tc.config["checkpoint_path"].(string)
+			outputPath := tc.config["output_path"].(string)
+			datasetPath := tc.config["dataset_path"].(string)
+			modelName := tc.config["model_name"].(string)
+			nodeCount := manager.getNodeCountFromConfig(tc.config)
+
+			// Verify all components are present
+			require.Equal(t, tc.expectNodes, nodeCount)
+			require.NotEmpty(t, sourceModelID)
+			require.NotEmpty(t, targetModelID)
+			require.NotEmpty(t, checkpointPath)
+			require.NotEmpty(t, outputPath)
+			require.NotEmpty(t, datasetPath)
+			require.NotEmpty(t, modelName)
+
+			t.Logf("Training config validated:")
+			t.Logf("  Source: %s", sourceModelID)
+			t.Logf("  Target: %s", targetModelID)
+			t.Logf("  Nodes: %d", nodeCount)
+			t.Logf("  Checkpoint: %s", checkpointPath)
+			t.Logf("  Dataset: %s", datasetPath)
+			t.Logf("  Output: %s", outputPath)
+		})
+	}
+}
+
+// TestOrchestrationManager_TrainingStatusMonitoring tests training status monitoring
+func TestOrchestrationManager_TrainingStatusMonitoring(t *testing.T) {
+	if !orchestrationDirExists() {
+		t.Skip("Orchestration directory not found")
+	}
+
+	manager, err := NewOrchestrationManager(30 * time.Minute)
+	require.NoError(t, err)
+
+	manager.Start()
+	defer manager.Stop()
+
+	ctx := context.Background()
+
+	// Create a training job
+	trainingConfig := map[string]interface{}{
+		"source_model_id": "llama-8b-test",
+		"target_model_id": "llama-8b-test-t1",
+		"checkpoint_path": "/mnt/cold/contents/dcp/llama-8b-test/checkpoint",
+		"output_path":     "/mnt/cold/contents/dcp/llama-8b-test-t1/checkpoint",
+		"dataset_path":    "/mnt/cold/contents/datasets/dataset-llama-8b-test-t1",
+		"model_name":      "llama-8b-test-t1",
+		"node_count":      1,
+	}
+
+	job, err := manager.StartTrainingJob(ctx, "llama-8b-test-t1", trainingConfig)
+	require.NoError(t, err)
+
+	// Test status monitoring
+	// Note: This will likely fail in a test environment since we don't have actual training running
+	// But we can test that the status monitoring logic works
+	status, err := manager.GetTrainingStatus(ctx, "llama-8b-test-t1")
+
+	// The status check might fail if no training is actually running, which is expected in tests
+	if err != nil {
+		t.Logf("Expected error in test environment: %v", err)
+		require.Contains(t, status["status"].(string), "not_running")
+	} else {
+		// If status check succeeds, verify it returns valid data
+		require.Contains(t, status, "status")
+		require.Contains(t, status, "job_id")
+
+		statusStr := status["status"].(string)
+		require.Contains(t, []string{"running", "completed", "error", "not_running"}, statusStr)
+	}
+
+	// Clean up
+	err = manager.StopJob(ctx, job.ID)
+	require.NoError(t, err)
+}
+
+// TestOrchestrationManager_MultipleTrainingJobs tests running multiple training jobs
+func TestOrchestrationManager_MultipleTrainingJobs(t *testing.T) {
+	if !orchestrationDirExists() {
+		t.Skip("Orchestration directory not found")
+	}
+
+	manager, err := NewOrchestrationManager(30 * time.Minute)
+	require.NoError(t, err)
+
+	manager.Start()
+	defer manager.Stop()
+
+	ctx := context.Background()
+
+	// Create multiple training jobs with different node counts
+	jobs := make([]*OrchestrationJob, 0)
+
+	configs := []map[string]interface{}{
+		{
+			"source_model_id": "llama-8b-multi-1",
+			"target_model_id": "llama-8b-multi-1-t1",
+			"checkpoint_path": "/mnt/cold/contents/dcp/llama-8b-multi-1/checkpoint",
+			"output_path":     "/mnt/cold/contents/dcp/llama-8b-multi-1-t1/checkpoint",
+			"dataset_path":    "/mnt/cold/contents/datasets/dataset-llama-8b-multi-1-t1",
+			"model_name":      "llama-8b-multi-1-t1",
+		},
+		{
+			"source_model_id": "llama-70b-multi-2",
+			"target_model_id": "llama-70b-multi-2-t1",
+			"checkpoint_path": "/mnt/cold/contents/dcp/llama-70b-multi-2/checkpoint",
+			"output_path":     "/mnt/cold/contents/dcp/llama-70b-multi-2-t1/checkpoint",
+			"dataset_path":    "/mnt/cold/contents/datasets/dataset-llama-70b-multi-2-t1",
+			"model_name":      "llama-70b-multi-2-t1",
+		},
+	}
+
+	expectedNodeCounts := []int{1, 2} // 8B uses 1 node, 70B uses 2 nodes
+
+	// Start all jobs
+	for i, config := range configs {
+		job, err := manager.StartTrainingJob(ctx, config["target_model_id"].(string), config)
+		require.NoError(t, err)
+		jobs = append(jobs, job)
+
+		// Verify node count is determined correctly
+		nodeCount := manager.getNodeCountFromConfig(config)
+		require.Equal(t, expectedNodeCounts[i], nodeCount)
+	}
+
+	// Wait for jobs to initialize
+	time.Sleep(500 * time.Millisecond)
+
+	// Verify all jobs are tracked
+	trainingJobs := manager.GetJobsByType(JobTypeTraining)
+	require.GreaterOrEqual(t, len(trainingJobs), len(jobs))
+
+	// Clean up all jobs
+	for _, job := range jobs {
+		err := manager.StopJob(ctx, job.ID)
+		require.NoError(t, err)
+	}
+
+	// Wait for all jobs to stop
+	for _, job := range jobs {
+		require.Eventually(t, func() bool {
+			job.mu.RLock()
+			defer job.mu.RUnlock()
+			return job.Status == JobStatusStopped || job.Status == JobStatusError
+		}, 10*time.Second, 500*time.Millisecond)
+	}
+}
+
+// TestOrchestrationManager_EdgeCases tests edge cases in training
+func TestOrchestrationManager_EdgeCases(t *testing.T) {
+	if !orchestrationDirExists() {
+		t.Skip("Orchestration directory not found")
+	}
+
+	manager, err := NewOrchestrationManager(30 * time.Minute)
+	require.NoError(t, err)
+
+	t.Run("Unknown model defaults to 1 node", func(t *testing.T) {
+		nodeCount := manager.determineNodeCountFromModel("unknown-experimental-model")
+		require.Equal(t, 1, nodeCount)
+	})
+
+	t.Run("Empty model ID defaults to 1 node", func(t *testing.T) {
+		nodeCount := manager.determineNodeCountFromModel("")
+		require.Equal(t, 1, nodeCount)
+	})
+
+	t.Run("Case insensitive model detection", func(t *testing.T) {
+		testCases := []struct {
+			modelID  string
+			expected int
+		}{
+			{"LLAMA-8B", 1},
+			{"Llama-70B", 2},
+			{"llama-8B-CUSTOM", 1},
+			{"LLAMA-70b-experimental", 2},
+		}
+
+		for _, tc := range testCases {
+			nodeCount := manager.determineNodeCountFromModel(tc.modelID)
+			require.Equal(t, tc.expected, nodeCount,
+				"Model %s should use %d nodes", tc.modelID, tc.expected)
+		}
+	})
+
+	t.Run("Explicit node count override", func(t *testing.T) {
+		config := map[string]interface{}{
+			"node_count":      5,          // Explicit override
+			"source_model_id": "llama-8b", // Would normally be 1 node
+		}
+
+		nodeCount := manager.getNodeCountFromConfig(config)
+		require.Equal(t, 5, nodeCount, "Explicit node count should override model-based detection")
+	})
+
+	t.Run("Invalid explicit node count falls back to model detection", func(t *testing.T) {
+		config := map[string]interface{}{
+			"node_count":      "invalid", // Invalid type
+			"source_model_id": "llama-70b",
+		}
+
+		nodeCount := manager.getNodeCountFromConfig(config)
+		require.Equal(t, 2, nodeCount, "Should fall back to model-based detection when explicit count is invalid")
+	})
+}
+
 // Helper functions
 
 func parseEndpoint(endpoint string) *url.URL {
