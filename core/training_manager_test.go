@@ -215,7 +215,7 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 		CheckpointPath: filepath.Join(checkpointPath, "step-0"),
 		OutputPath:     "/mnt/cold/contents/dcp/llama-8b-trained-test/checkpoint",
 		Dataset:        string(datasetJSON),
-		ModelSize:      "8B",
+		ModelSize:      "8B", // Must be uppercase
 	}
 
 	// Create internal request
@@ -239,7 +239,7 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 	// Check training status periodically
 	// This simulates what the backend would do - sending TrainingStatusRequest messages
 	statusCheckCount := 0
-	maxStatusChecks := 90 // 15 minutes max
+	maxStatusChecks := 60 // 5 minutes max
 	datasetProcessed := false
 	trainingStarted := false
 	lastStatus := ""
@@ -291,8 +291,15 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 			// Only consider training as started if we're past the initial setup
 			trainingStarted = true
 			t.Log("Training has started and is making progress")
-			// Continue monitoring for a bit to ensure it's stable
-			time.Sleep(10 * time.Second)
+		}
+
+		// Check if training completed
+		if job.Status == "completed" {
+			trainingStarted = true
+			t.Log("Training has completed successfully!")
+			// Wait for scale-down to complete
+			t.Log("Waiting for training nodes to scale down...")
+			time.Sleep(60 * time.Second) // Give time for scale-down
 			break
 		}
 
@@ -301,7 +308,7 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 		}
 
 		// Wait before next check
-		time.Sleep(10 * time.Second)
+		time.Sleep(5 * time.Second)
 	}
 
 	// Verify the job progressed through expected stages
@@ -342,5 +349,35 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 	}
 
 	// Clean shutdown
-	t.Log("Test completed, shutting down nexus...")
+	t.Log("Test completed, waiting for cleanup...")
+
+	// Wait for the orchestration job to be fully stopped (including scale-down)
+	orchJobs := nexus.orchestrationMgr.GetJobsByType(JobTypeTraining)
+	for _, orchJob := range orchJobs {
+		orchJob.mu.RLock()
+		jobID := orchJob.ID
+		modelID := orchJob.ModelID
+		orchJob.mu.RUnlock()
+
+		if modelID == "llama-8b-trained-test" {
+			t.Logf("Waiting for orchestration job %s to complete cleanup...", jobID)
+
+			// Wait up to 2 minutes for the job to be fully stopped
+			deadline := time.Now().Add(5 * time.Minute)
+			for time.Now().Before(deadline) {
+				orchJob.mu.RLock()
+				status := orchJob.Status
+				orchJob.mu.RUnlock()
+
+				if status == JobStatusStopped || status == JobStatusError {
+					t.Logf("Orchestration job %s is now %s", jobID, status)
+					break
+				}
+
+				time.Sleep(5 * time.Second)
+			}
+		}
+	}
+
+	t.Log("Shutting down nexus...")
 }
