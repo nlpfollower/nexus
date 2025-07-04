@@ -826,6 +826,7 @@ func (m *OrchestrationManager) startTrainingProcess(ctx context.Context, job *Or
 	datasetPath := job.Config["dataset_path"].(string)
 	modelName := job.Config["model_name"].(string)
 	modelSize := job.Config["model_size"].(string)
+	modelSize = strings.ToLower(modelSize)
 
 	// Determine node count
 	nodeCount := m.getNodeCountFromConfig(job.Config)
@@ -840,6 +841,14 @@ func (m *OrchestrationManager) startTrainingProcess(ctx context.Context, job *Or
 		"--model-size", modelSize,
 		"--node-count", fmt.Sprintf("%d", nodeCount),
 		"--skip-cluster-creation",
+	}
+
+	// Add RAID mount paths if specified
+	if raidMountPath, ok := job.Config["raid_mount_path"].(string); ok && raidMountPath != "" {
+		args = append(args, "--raid-mount-path", raidMountPath)
+	}
+	if raidName, ok := job.Config["raid_name"].(string); ok && raidName != "" {
+		args = append(args, "--raid-name", raidName)
 	}
 
 	// Log the training configuration

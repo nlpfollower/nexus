@@ -302,6 +302,8 @@ func (tm *TrainingManager) startTrainingProcess(ctx context.Context, job *Traini
 		"model_name":      req.TargetModelID,
 		"model_size":      req.ModelSize, // Pass model size to orchestration
 		"node_count":      job.NodeCount, // Use determined node count
+		"raid_mount_path": "/mnt/cold",   // Add RAID mount path
+		"raid_name":       "cold-new",    // Add RAID name
 	}
 
 	// Start training via orchestration manager
