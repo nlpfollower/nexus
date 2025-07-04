@@ -201,9 +201,6 @@ type TrainingRequest struct {
 	OutputPath     string    `json:"output_path"`
 	Dataset        string    `json:"dataset"`
 	ModelSize      string    `json:"model_size"` // "8B", "70B", etc.
-	LearningRate   float64   `json:"learning_rate"`
-	BatchSize      int       `json:"batch_size"`
-	NumEpochs      int       `json:"num_epochs"`
 }
 
 func (r *TrainingRequest) NexusRequestType() RequestType {

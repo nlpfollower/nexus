@@ -58,9 +58,8 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 	// Wait for nexus to be ready
 	time.Sleep(2 * time.Second)
 
-	// Create a mock connection ID
-	// The "connection not found" error is harmless for this test since we're not reading responses
-	connectionID := "test-conn-" + uuid.New().String()
+	// Use empty connection ID - responses will be dropped silently
+	connectionID := ""
 
 	// Create user and model ID
 	userID := db.NewDigest([]byte("test-user"))
@@ -77,7 +76,7 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 		ModelID:        modelID,
 		Messages:       []Message{{Role: "user", Content: "Hello, test"}},
 		CheckpointPath: checkpointPath,
-		ModelSize:      "8B",
+		ModelSize:      "8B", // Must be uppercase
 	}
 
 	inferRequest := &Request{
@@ -92,6 +91,11 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 	// Process the inference request
 	err = nexus.processRequest(inferRequest)
 	require.NoError(t, err)
+
+	// Stop the inference immediately after starting it
+	// We only needed to trigger model loading, not get the actual response
+	time.Sleep(1 * time.Second) // Give it a moment to start
+	nexus.stopGeneration(inferRequestID)
 
 	// Wait for the orchestration job to get the endpoint
 	var endpoint string
@@ -129,6 +133,17 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 	t.Log("Waiting for VLLM to be ready within mindlet...")
 	err = waitForVLLMReady(endpoint, 3*time.Minute)
 	require.NoError(t, err, "VLLM failed to start")
+
+	// Stop the inference generation that we started just to load the model
+	// This prevents the streaming responses from continuing
+	if gen, exists := nexus.activeGenerations.Get(inferRequestID.String()); exists {
+		gen.stream.Stop()
+		nexus.activeGenerations.Remove(inferRequestID.String())
+		t.Log("Stopped initial inference generation")
+	}
+
+	// Give a moment for cleanup
+	time.Sleep(2 * time.Second)
 
 	t.Log("VLLM is ready, proceeding with training dataset creation...")
 
@@ -192,10 +207,7 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 		CheckpointPath: checkpointPath,
 		OutputPath:     "/mnt/cold/contents/dcp/llama-8b-trained-test/checkpoint",
 		Dataset:        string(datasetJSON),
-		ModelSize:      "8B",
-		LearningRate:   0.0001,
-		BatchSize:      32,
-		NumEpochs:      3,
+		ModelSize:      "8B", // Must be uppercase
 	}
 
 	// Create internal request
