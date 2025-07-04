@@ -315,6 +315,7 @@ func (m *OrchestrationManager) stopInferenceProcess(ctx context.Context, job *Or
 func (m *OrchestrationManager) stopTrainingProcess(ctx context.Context, job *OrchestrationJob) error {
 	log.Printf("Stopping training job %s", job.ID)
 
+	// First, stop the training process
 	args := []string{
 		"mindlet", "train", "stop",
 		"--skip-cluster-creation",
@@ -324,11 +325,33 @@ func (m *OrchestrationManager) stopTrainingProcess(ctx context.Context, job *Orc
 	if err != nil {
 		// Log but don't fail if stop command has issues
 		log.Printf("Training stop command returned error: %v\nOutput: %s", err, string(output))
-		// Still mark as successful stop since the command executed
-		return nil
 	}
 
-	log.Printf("Training job %s stopped successfully", job.ID)
+	// Then scale down the nodes to release resources
+	log.Printf("Scaling down training nodes for job %s", job.ID)
+
+	// Get RAID config from job config
+	scaleDownArgs := []string{
+		"mindlet", "train",
+		"--skip-cluster-creation",
+		"--scale-down",
+	}
+
+	// Add RAID mount paths if they were specified in the original config
+	if raidMountPath, ok := job.Config["raid_mount_path"].(string); ok && raidMountPath != "" {
+		scaleDownArgs = append(scaleDownArgs, "--raid-mount-path", raidMountPath)
+	}
+	if raidName, ok := job.Config["raid_name"].(string); ok && raidName != "" {
+		scaleDownArgs = append(scaleDownArgs, "--raid-name", raidName)
+	}
+
+	scaleOutput, scaleErr := m.executeOrchestrationCommand(ctx, scaleDownArgs...)
+	if scaleErr != nil {
+		log.Printf("Training scale-down command returned error: %v\nOutput: %s", scaleErr, string(scaleOutput))
+		// Still return nil since we want to mark the job as stopped even if scale-down fails
+	}
+
+	log.Printf("Training job %s stopped and scaled down", job.ID)
 	return nil
 }
 
@@ -810,7 +833,6 @@ func (m *OrchestrationManager) determineNodeCountFromModelSize(modelSize string)
 	}
 }
 
-// Updated startTrainingProcess to use dynamic node count
 func (m *OrchestrationManager) startTrainingProcess(ctx context.Context, job *OrchestrationJob) error {
 	job.mu.Lock()
 	job.Status = JobStatusInitializing
@@ -855,10 +877,17 @@ func (m *OrchestrationManager) startTrainingProcess(ctx context.Context, job *Or
 	log.Printf("  Source Model: %s", sourceModelID)
 	log.Printf("  Target Model: %s", targetModelID)
 	log.Printf("  Model Name: %s", modelName)
+	log.Printf("  Model Size: %s", modelSize)
 	log.Printf("  Node Count: %d", nodeCount)
 	log.Printf("  Checkpoint Path: %s", checkpointPath)
 	log.Printf("  Dataset Path: %s", datasetPath)
 	log.Printf("  Output Path: %s", outputPath)
+	if raidMountPath, ok := job.Config["raid_mount_path"].(string); ok && raidMountPath != "" {
+		log.Printf("  RAID Mount Path: %s", raidMountPath)
+	}
+	if raidName, ok := job.Config["raid_name"].(string); ok && raidName != "" {
+		log.Printf("  RAID Name: %s", raidName)
+	}
 
 	// Execute the training command
 	output, err := m.executeOrchestrationCommand(ctx, args...)
@@ -908,7 +937,18 @@ func (m *OrchestrationManager) monitorTrainingProgress(job *OrchestrationJob) {
 					job.StoppedAt = &now
 					job.mu.Unlock()
 					log.Printf("Training job %s completed", job.ID)
+
+					// Scale down the training nodes after completion
+					log.Printf("Scaling down training nodes for completed job %s", job.ID)
+					ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+					if err := m.stopTrainingProcess(ctx, job); err != nil {
+						log.Printf("Error scaling down completed training job %s: %v", job.ID, err)
+					} else {
+						log.Printf("Successfully scaled down training nodes for job %s", job.ID)
+					}
+					cancel()
 					return
+
 				case "error", "failed":
 					job.Status = JobStatusError
 					if errMsg, ok := status["error"].(string); ok {
@@ -918,10 +958,20 @@ func (m *OrchestrationManager) monitorTrainingProgress(job *OrchestrationJob) {
 					job.StoppedAt = &now
 					job.mu.Unlock()
 					log.Printf("Training job %s failed", job.ID)
+
+					// Also scale down on error
+					log.Printf("Scaling down training nodes for failed job %s", job.ID)
+					ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+					if err := m.stopTrainingProcess(ctx, job); err != nil {
+						log.Printf("Error scaling down failed training job %s: %v", job.ID, err)
+					}
+					cancel()
 					return
+
 				case "running":
 					// Continue monitoring
 					job.mu.Unlock()
+
 				default:
 					job.mu.Unlock()
 				}
