@@ -934,56 +934,45 @@ func (m *OrchestrationManager) monitorTrainingProgress(job *OrchestrationJob) {
 				continue
 			}
 
-			job.mu.Lock()
-			// Update job with latest status
+			// Check the status from orchestration
 			if statusStr, ok := status["status"].(string); ok {
 				switch statusStr {
 				case "completed":
-					job.Status = JobStatusStopped
-					now := time.Now()
-					job.StoppedAt = &now
-					job.mu.Unlock()
-					log.Printf("Training job %s completed", job.ID)
+					log.Printf("Training job %s completed, stopping and scaling down", job.ID)
 
-					// Scale down the training nodes after completion
-					log.Printf("Scaling down training nodes for completed job %s", job.ID)
-					ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-					if err := m.stopTrainingProcess(ctx, job); err != nil {
-						log.Printf("Error scaling down completed training job %s: %v", job.ID, err)
-					} else {
-						log.Printf("Successfully scaled down training nodes for job %s", job.ID)
+					// Use stopJob which handles status updates properly
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+					if err := m.stopJob(ctx, job); err != nil {
+						log.Printf("Error stopping completed training job %s: %v", job.ID, err)
 					}
 					cancel()
 					return
 
 				case "error", "failed":
-					job.Status = JobStatusError
+					// Update error info before stopping
+					job.mu.Lock()
 					if errMsg, ok := status["error"].(string); ok {
 						job.LastError = fmt.Errorf(errMsg)
 					}
-					now := time.Now()
-					job.StoppedAt = &now
 					job.mu.Unlock()
-					log.Printf("Training job %s failed", job.ID)
 
-					// Also scale down on error
-					log.Printf("Scaling down training nodes for failed job %s", job.ID)
-					ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-					if err := m.stopTrainingProcess(ctx, job); err != nil {
-						log.Printf("Error scaling down failed training job %s: %v", job.ID, err)
+					log.Printf("Training job %s failed, stopping and scaling down", job.ID)
+
+					// Use stopJob for failed jobs too
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+					if err := m.stopJob(ctx, job); err != nil {
+						log.Printf("Error stopping failed training job %s: %v", job.ID, err)
 					}
 					cancel()
 					return
 
 				case "running":
 					// Continue monitoring
-					job.mu.Unlock()
+					log.Printf("Training job %s still running", job.ID)
 
 				default:
-					job.mu.Unlock()
+					log.Printf("Unknown training status for job %s: %s", job.ID, statusStr)
 				}
-			} else {
-				job.mu.Unlock()
 			}
 		}
 	}
