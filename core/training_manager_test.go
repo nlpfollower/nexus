@@ -173,7 +173,7 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, job)
 	require.Equal(t, jobID, job.JobID)
-	require.Equal(t, "llama-8b-base", job.SourceModelID)
+	require.Equal(t, "llama-8b", job.SourceModelID)
 	require.Equal(t, "llama-8b-trained-test", job.TargetModelID)
 	require.Equal(t, 1, job.NodeCount, "8B model should use 1 node")
 
