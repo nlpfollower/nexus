@@ -77,7 +77,7 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 		ModelID:        modelID,
 		Messages:       []Message{{Role: "user", Content: "Hello, test"}},
 		CheckpointPath: checkpointPath,
-		ModelSize:      "8b",
+		ModelSize:      "8B",
 	}
 
 	inferRequest := &Request{
@@ -192,7 +192,7 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 		CheckpointPath: checkpointPath,
 		OutputPath:     "/mnt/cold/contents/dcp/llama-8b-trained-test/checkpoint",
 		Dataset:        string(datasetJSON),
-		ModelSize:      "8b",
+		ModelSize:      "8B",
 		LearningRate:   0.0001,
 		BatchSize:      32,
 		NumEpochs:      3,

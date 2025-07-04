@@ -826,7 +826,6 @@ func (m *OrchestrationManager) startTrainingProcess(ctx context.Context, job *Or
 	datasetPath := job.Config["dataset_path"].(string)
 	modelName := job.Config["model_name"].(string)
 	modelSize := job.Config["model_size"].(string)
-	modelSize = strings.ToLower(modelSize)
 
 	// Determine node count
 	nodeCount := m.getNodeCountFromConfig(job.Config)
