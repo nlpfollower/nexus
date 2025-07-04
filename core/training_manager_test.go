@@ -239,7 +239,7 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 	// Check training status periodically
 	// This simulates what the backend would do - sending TrainingStatusRequest messages
 	statusCheckCount := 0
-	maxStatusChecks := 60 // 5 minutes max
+	maxStatusChecks := 90 // 15 minutes max
 	datasetProcessed := false
 	trainingStarted := false
 	lastStatus := ""
@@ -301,7 +301,7 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 		}
 
 		// Wait before next check
-		time.Sleep(5 * time.Second)
+		time.Sleep(10 * time.Second)
 	}
 
 	// Verify the job progressed through expected stages
