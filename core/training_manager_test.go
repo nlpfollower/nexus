@@ -3,8 +3,6 @@ package core
 import (
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -12,16 +10,6 @@ import (
 	"github.com/nlpfollower/deltamind/database/db"
 	"github.com/stretchr/testify/require"
 )
-
-func orchestrationDirExists() bool {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return false
-	}
-	orchestrationDir := filepath.Join(homeDir, "orchestration")
-	_, err = os.Stat(orchestrationDir)
-	return err == nil
-}
 
 func TestNexusTrainingWithDataset(t *testing.T) {
 	if !orchestrationDirExists() {
