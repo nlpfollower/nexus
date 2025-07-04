@@ -335,6 +335,7 @@ func (m *OrchestrationManager) stopTrainingProcess(ctx context.Context, job *Orc
 		"mindlet", "train",
 		"--skip-cluster-creation",
 		"--scale-down",
+		"--node-count", "1",
 	}
 
 	// Add RAID mount paths if they were specified in the original config
@@ -346,6 +347,9 @@ func (m *OrchestrationManager) stopTrainingProcess(ctx context.Context, job *Orc
 	}
 	if datasetPath, ok := job.Config["dataset_path"].(string); ok && datasetPath != "" {
 		scaleDownArgs = append(scaleDownArgs, "--dataset-path", datasetPath)
+	}
+	if modelName, ok := job.Config["model_name"].(string); ok && modelName != "" {
+		scaleDownArgs = append(scaleDownArgs, "--model-name", modelName)
 	}
 
 	scaleOutput, scaleErr := m.executeOrchestrationCommand(ctx, scaleDownArgs...)
