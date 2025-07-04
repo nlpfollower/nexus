@@ -344,6 +344,9 @@ func (m *OrchestrationManager) stopTrainingProcess(ctx context.Context, job *Orc
 	if raidName, ok := job.Config["raid_name"].(string); ok && raidName != "" {
 		scaleDownArgs = append(scaleDownArgs, "--raid-name", raidName)
 	}
+	if datasetPath, ok := job.Config["dataset_path"].(string); ok && datasetPath != "" {
+		scaleDownArgs = append(scaleDownArgs, "--dataset-path", datasetPath)
+	}
 
 	scaleOutput, scaleErr := m.executeOrchestrationCommand(ctx, scaleDownArgs...)
 	if scaleErr != nil {
