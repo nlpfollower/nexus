@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -41,7 +43,13 @@ func waitForVLLMReady(endpoint string, timeout time.Duration) error {
 }
 
 func TestNexusTrainingWithDataset(t *testing.T) {
-	if !orchestrationDirExists() {
+	// Check for orchestration directory
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("Cannot get home directory")
+	}
+	orchestrationDir := filepath.Join(homeDir, "orchestration")
+	if _, err := os.Stat(orchestrationDir); os.IsNotExist(err) {
 		t.Skip("Orchestration directory not found, skipping test")
 	}
 
@@ -229,22 +237,45 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	// Check training status periodically
-	// We want to see the job progress through multiple stages:
-	// processing_dataset -> processed_dataset -> starting_training -> training
+	// This simulates what the backend would do - sending TrainingStatusRequest messages
 	statusCheckCount := 0
 	maxStatusChecks := 60 // 5 minutes max
 	datasetProcessed := false
 	trainingStarted := false
+	lastStatus := ""
 
 	for statusCheckCount < maxStatusChecks {
 		statusCheckCount++
 
-		// Get the job from training manager to check status
+		// Create status request - this is what backend would send
+		statusRequestID := db.NewDigest([]byte(uuid.New().String()))
+		statusReq := &TrainingStatusRequest{
+			JobID: jobID,
+		}
+
+		statusRequest := &Request{
+			RequestID:    statusRequestID,
+			Type:         RequestTypeTrainingStatus,
+			ConnectionID: connectionID,
+			Status:       RequestStatusPending,
+			Data:         statusReq,
+			CreatedAt:    time.Now(),
+		}
+
+		// Process status request
+		err = nexus.processRequest(statusRequest)
+		require.NoError(t, err)
+
+		// In production, the response would go through the connection
+		// For testing, we'll check the job directly (equivalent to parsing the response)
 		job, err := nexus.trainingMgr.GetJobStatus(jobID)
 		require.NoError(t, err)
 
-		t.Logf("Training status check %d/%d: Status=%s, Progress=%.2f%%",
-			statusCheckCount, maxStatusChecks, job.Status, job.Progress*100)
+		// Only log if status changed
+		if job.Status != lastStatus {
+			t.Logf("Training status changed to: %s (Progress: %.2f%%)", job.Status, job.Progress*100)
+			lastStatus = job.Status
+		}
 
 		// Track progress through stages
 		if job.Status == "processed_dataset" {
@@ -252,10 +283,16 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 			t.Log("Dataset processing completed successfully")
 		}
 
-		if job.Status == "starting_training" || job.Status == "training" {
+		if job.Status == "starting_training" {
+			t.Log("Training is being initialized...")
+		}
+
+		if job.Status == "training" && job.Progress > 0.5 {
+			// Only consider training as started if we're past the initial setup
 			trainingStarted = true
-			t.Log("Training has started successfully")
-			// We can stop here for the test
+			t.Log("Training has started and is making progress")
+			// Continue monitoring for a bit to ensure it's stable
+			time.Sleep(10 * time.Second)
 			break
 		}
 
@@ -268,8 +305,23 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 	}
 
 	// Verify the job progressed through expected stages
-	require.True(t, datasetProcessed || trainingStarted,
-		"Job should have at least processed the dataset or started training")
+	require.True(t, datasetProcessed, "Dataset should have been processed")
+	require.True(t, trainingStarted, "Training should have started")
+
+	// Final verification - send one more status request
+	finalStatusReq := &TrainingStatusRequest{
+		JobID: jobID,
+	}
+	finalRequest := &Request{
+		RequestID:    db.NewDigest([]byte(uuid.New().String())),
+		Type:         RequestTypeTrainingStatus,
+		ConnectionID: connectionID,
+		Status:       RequestStatusPending,
+		Data:         finalStatusReq,
+		CreatedAt:    time.Now(),
+	}
+	err = nexus.processRequest(finalRequest)
+	require.NoError(t, err)
 
 	// Final verification
 	job, err := nexus.trainingMgr.GetJobStatus(jobID)
