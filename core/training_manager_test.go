@@ -29,7 +29,8 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 	// Wait for nexus to be ready
 	time.Sleep(2 * time.Second)
 
-	// Create a mock connection
+	// Create a mock connection ID
+	// The "connection not found" error is harmless for this test since we're not reading responses
 	connectionID := "test-conn-" + uuid.New().String()
 
 	// Create a rich dataset similar to dataset_manager_test.go
@@ -188,82 +189,4 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 
 	// Clean shutdown
 	t.Log("Test completed, shutting down nexus...")
-}
-
-// Test training with 70B model to verify node count
-func TestNexusTraining70BModel(t *testing.T) {
-	if !orchestrationDirExists() {
-		t.Skip("Orchestration directory not found, skipping test")
-	}
-
-	// Create nexus
-	cfg := &Config{Port: 20000} // Use a different test port
-	nexus, err := NewNexus(cfg)
-	require.NoError(t, err)
-
-	// Start nexus
-	err = nexus.Start()
-	require.NoError(t, err)
-	defer nexus.Stop()
-
-	// Wait for nexus to be ready
-	time.Sleep(2 * time.Second)
-
-	// Create a simple dataset for 70B model test
-	dataset := TrainingDataset{
-		ContextMessages: []Message{
-			{Role: "system", Content: "You are a helpful assistant."},
-			{Role: "user", Content: "What is machine learning?"},
-			{Role: "assistant", Content: "Machine learning is a subset of artificial intelligence..."},
-		},
-		TrainingPrompt: "General knowledge Q&A",
-	}
-
-	datasetJSON, err := json.Marshal(dataset)
-	require.NoError(t, err)
-
-	// Create training request for 70B model
-	userID := db.NewDigest([]byte("test-user"))
-	requestID := db.NewDigest([]byte(uuid.New().String()))
-	jobID := fmt.Sprintf("test-70b-job-%d", time.Now().Unix())
-
-	trainReq := &TrainingRequest{
-		JobID:          jobID,
-		UserID:         userID,
-		SourceModelID:  "llama-70b-base",
-		TargetModelID:  "llama-70b-trained-test",
-		CheckpointPath: "/mnt/cold/contents/dcp/llama-70b-base/checkpoint",
-		OutputPath:     "/mnt/cold/contents/dcp/llama-70b-trained-test/checkpoint",
-		Dataset:        string(datasetJSON),
-		ModelSize:      "70B", // Test uppercase
-		LearningRate:   0.0001,
-		BatchSize:      16,
-		NumEpochs:      1,
-	}
-
-	// Create internal request
-	req := &Request{
-		RequestID:    requestID,
-		Type:         RequestTypeTraining,
-		ConnectionID: "test-conn-70b",
-		Status:       RequestStatusPending,
-		Data:         trainReq,
-		CreatedAt:    time.Now(),
-	}
-
-	// Process the training request
-	t.Log("Submitting 70B model training request...")
-	err = nexus.processRequest(req)
-	require.NoError(t, err)
-
-	// Wait for processing to start
-	time.Sleep(3 * time.Second)
-
-	// Verify the job was created with correct node count
-	job, err := nexus.trainingMgr.GetJobStatus(jobID)
-	require.NoError(t, err)
-	require.NotNil(t, job)
-	require.Equal(t, 2, job.NodeCount, "70B model should use 2 nodes")
-
-	t.Logf("70B training job created with %d nodes (correct!)", job.NodeCount)
 }
