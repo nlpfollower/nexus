@@ -3,6 +3,7 @@ package core
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"testing"
 	"time"
 
@@ -10,6 +11,34 @@ import (
 	"github.com/nlpfollower/deltamind/database/db"
 	"github.com/stretchr/testify/require"
 )
+
+// waitForVLLMReady waits for the mindlet server to have VLLM ready
+func waitForVLLMReady(endpoint string, timeout time.Duration) error {
+	client := &http.Client{Timeout: 10 * time.Second}
+	deadline := time.Now().Add(timeout)
+
+	for time.Now().Before(deadline) {
+		// Check health endpoint
+		resp, err := client.Get(endpoint + "/health")
+		if err == nil {
+			defer resp.Body.Close()
+
+			if resp.StatusCode == http.StatusOK {
+				var health map[string]interface{}
+				if err := json.NewDecoder(resp.Body).Decode(&health); err == nil {
+					// Check if VLLM is running
+					if vllmInfo, ok := health["vllm"].([]interface{}); ok && len(vllmInfo) > 0 {
+						return nil // VLLM is ready
+					}
+				}
+			}
+		}
+
+		time.Sleep(5 * time.Second)
+	}
+
+	return fmt.Errorf("timeout waiting for VLLM to be ready")
+}
 
 func TestNexusTrainingWithDataset(t *testing.T) {
 	if !orchestrationDirExists() {
@@ -32,6 +61,76 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 	// Create a mock connection ID
 	// The "connection not found" error is harmless for this test since we're not reading responses
 	connectionID := "test-conn-" + uuid.New().String()
+
+	// Create user and model ID
+	userID := db.NewDigest([]byte("test-user"))
+	modelID := "llama-8b"
+	checkpointPath := "/mnt/cold/contents/dcp/llama-8b/checkpoint"
+
+	// First, ensure the inference server is started and model is loaded
+	t.Log("Starting inference server and loading model...")
+
+	// Make an inference request to trigger model loading and VLLM startup
+	inferRequestID := db.NewDigest([]byte(uuid.New().String()))
+	inferReq := &InferenceRequest{
+		UserID:         userID,
+		ModelID:        modelID,
+		Messages:       []Message{{Role: "user", Content: "Hello, test"}},
+		CheckpointPath: checkpointPath,
+		ModelSize:      "8b",
+	}
+
+	inferRequest := &Request{
+		RequestID:    inferRequestID,
+		Type:         RequestTypeInference,
+		ConnectionID: connectionID,
+		Status:       RequestStatusPending,
+		Data:         inferReq,
+		CreatedAt:    time.Now(),
+	}
+
+	// Process the inference request
+	err = nexus.processRequest(inferRequest)
+	require.NoError(t, err)
+
+	// Wait for the orchestration job to get the endpoint
+	var endpoint string
+	checkCount := 0
+	maxChecks := 60 // 5 minutes max
+
+	for checkCount < maxChecks {
+		checkCount++
+
+		// Get running inference jobs
+		inferenceJobs := nexus.orchestrationMgr.GetJobsByType(JobTypeInference)
+		for _, job := range inferenceJobs {
+			job.mu.RLock()
+			if job.Status == JobStatusRunning && job.Endpoint != "" {
+				endpoint = job.Endpoint
+			}
+			job.mu.RUnlock()
+
+			if endpoint != "" {
+				break
+			}
+		}
+
+		if endpoint != "" {
+			t.Logf("Found inference endpoint after %d checks: %s", checkCount, endpoint)
+			break
+		}
+
+		time.Sleep(5 * time.Second)
+	}
+
+	require.NotEmpty(t, endpoint, "Failed to get inference endpoint")
+
+	// Now wait for VLLM to be ready within the mindlet server
+	t.Log("Waiting for VLLM to be ready within mindlet...")
+	err = waitForVLLMReady(endpoint, 3*time.Minute)
+	require.NoError(t, err, "VLLM failed to start")
+
+	t.Log("VLLM is ready, proceeding with training dataset creation...")
 
 	// Create a rich dataset similar to dataset_manager_test.go
 	contextMessages := []Message{
@@ -82,16 +181,15 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create training request
-	userID := db.NewDigest([]byte("test-user"))
 	requestID := db.NewDigest([]byte(uuid.New().String()))
 	jobID := fmt.Sprintf("test-training-job-%d", time.Now().Unix())
 
 	trainReq := &TrainingRequest{
 		JobID:          jobID,
 		UserID:         userID,
-		SourceModelID:  "llama-8b",
+		SourceModelID:  modelID,
 		TargetModelID:  "llama-8b-trained-test",
-		CheckpointPath: "/mnt/cold/contents/dcp/llama-8b/checkpoint",
+		CheckpointPath: checkpointPath,
 		OutputPath:     "/mnt/cold/contents/dcp/llama-8b-trained-test/checkpoint",
 		Dataset:        string(datasetJSON),
 		ModelSize:      "8b",
@@ -154,7 +252,7 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 		}
 
 		// Wait before next check
-		time.Sleep(10 * time.Second)
+		time.Sleep(5 * time.Second)
 	}
 
 	// Verify the job progressed through expected stages
@@ -166,7 +264,7 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, job)
 	require.Equal(t, jobID, job.JobID)
-	require.Equal(t, "llama-8b", job.SourceModelID)
+	require.Equal(t, modelID, job.SourceModelID)
 	require.Equal(t, "llama-8b-trained-test", job.TargetModelID)
 	require.Equal(t, 1, job.NodeCount, "8B model should use 1 node")
 
