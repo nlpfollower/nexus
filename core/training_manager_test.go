@@ -212,10 +212,10 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 		UserID:         userID,
 		SourceModelID:  modelID,
 		TargetModelID:  "llama-8b-trained-test",
-		CheckpointPath: checkpointPath,
+		CheckpointPath: filepath.Join(checkpointPath, "step-0"),
 		OutputPath:     "/mnt/cold/contents/dcp/llama-8b-trained-test/checkpoint",
 		Dataset:        string(datasetJSON),
-		ModelSize:      "8B", // Must be uppercase
+		ModelSize:      "8B",
 	}
 
 	// Create internal request
