@@ -88,9 +88,9 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 	trainReq := &TrainingRequest{
 		JobID:          jobID,
 		UserID:         userID,
-		SourceModelID:  "llama-8b-base",
+		SourceModelID:  "llama-8b",
 		TargetModelID:  "llama-8b-trained-test",
-		CheckpointPath: "/mnt/cold/contents/dcp/llama-8b-base/checkpoint",
+		CheckpointPath: "/mnt/cold/contents/dcp/llama-8b/checkpoint",
 		OutputPath:     "/mnt/cold/contents/dcp/llama-8b-trained-test/checkpoint",
 		Dataset:        string(datasetJSON),
 		ModelSize:      "8b",
