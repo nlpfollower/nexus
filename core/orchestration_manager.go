@@ -554,74 +554,39 @@ func (m *OrchestrationManager) GetTrainingStatus(ctx context.Context, jobID stri
 	status := job.Status
 	trainingCompleted := job.TrainingCompleted
 	completedAt := job.CompletedAt
+	lastError := job.LastError
 	job.mu.RUnlock()
 
-	// For completed training jobs, return cached status without calling mindlet
-	if trainingCompleted {
-		result := map[string]interface{}{
-			"status": "completed",
-			"job_id": jobID,
-		}
+	// Build status response
+	result := map[string]interface{}{
+		"job_id": jobID,
+	}
+
+	switch {
+	case trainingCompleted:
+		result["status"] = "completed"
 		if completedAt != nil {
 			result["completed_at"] = *completedAt
 		}
-		return result, nil
+
+	case status == JobStatusRunning || status == JobStatusInitializing:
+		result["status"] = "running"
+		// Progress tracking could be added here if needed
+
+	case status == JobStatusStopped:
+		result["status"] = "stopped"
+
+	case status == JobStatusError:
+		result["status"] = "error"
+		if lastError != nil {
+			result["error"] = lastError.Error()
+		}
+
+	default:
+		result["status"] = string(status)
 	}
 
-	// For stopped/error jobs, also return cached status
-	if status == JobStatusStopped || status == JobStatusError {
-		result := map[string]interface{}{
-			"status": string(status),
-			"job_id": jobID,
-		}
-
-		if status == JobStatusError {
-			job.mu.RLock()
-			if job.LastError != nil {
-				result["error"] = job.LastError.Error()
-			}
-			job.mu.RUnlock()
-		}
-
-		return result, nil
-	}
-
-	// Only check live status for running/initializing jobs
-	if status == JobStatusRunning || status == JobStatusInitializing {
-		liveStatus, err := m.checkTrainingStatus(ctx, jobID)
-		if err != nil {
-			// Return basic status if live check fails
-			return map[string]interface{}{
-				"status": string(status),
-				"job_id": jobID,
-			}, nil
-		}
-
-		// Add progress calculation based on training status
-		if trainingStatus, ok := liveStatus["status"].(string); ok {
-			result := map[string]interface{}{
-				"status": trainingStatus,
-				"job_id": jobID,
-			}
-
-			// Copy any additional fields from live status
-			for k, v := range liveStatus {
-				if k != "status" && k != "job_id" {
-					result[k] = v
-				}
-			}
-
-			return result, nil
-		}
-
-		return liveStatus, nil
-	}
-
-	// Return basic status for other states
-	return map[string]interface{}{
-		"status": string(status),
-		"job_id": jobID,
-	}, nil
+	return result, nil
 }
 
 // executeOrchestrationCommand runs a command in the orchestration directory
@@ -975,68 +940,71 @@ func (m *OrchestrationManager) monitorTrainingProgress(job *OrchestrationJob) {
 	for {
 		select {
 		case <-ticker.C:
-			// First check if we already marked this as completed
 			job.mu.RLock()
 			alreadyCompleted := job.TrainingCompleted
+			currentStatus := job.Status
 			job.mu.RUnlock()
 
-			if alreadyCompleted {
-				// Already handled, stop monitoring
+			if alreadyCompleted || currentStatus == JobStatusStopped || currentStatus == JobStatusError {
+				// Already handled
 				return
 			}
 
-			// Check training status using mindlet train status command
-			status, err := m.checkTrainingStatus(context.Background(), job.ID)
-			if err != nil {
-				log.Printf("Error checking training status for job %s: %v", job.ID, err)
-				continue
-			}
+			// Only check actual training status if job is running
+			if currentStatus == JobStatusRunning {
+				// Check training status using mindlet
+				status, err := m.checkTrainingStatus(context.Background(), job.ID)
+				if err != nil {
+					log.Printf("Error checking training status for job %s: %v", job.ID, err)
+					continue
+				}
 
-			// Check the status from orchestration
-			if statusStr, ok := status["status"].(string); ok {
-				switch statusStr {
-				case "completed":
-					// Mark training as completed BEFORE scaling down
-					job.mu.Lock()
-					job.TrainingCompleted = true
-					now := time.Now()
-					job.CompletedAt = &now
-					job.mu.Unlock()
+				if statusStr, ok := status["status"].(string); ok {
+					switch statusStr {
+					case "completed":
+						// Mark training as completed
+						job.mu.Lock()
+						job.TrainingCompleted = true
+						now := time.Now()
+						job.CompletedAt = &now
+						job.mu.Unlock()
 
-					log.Printf("Training job %s completed (orchestration job stopping), starting scale down", job.ID)
+						log.Printf("Training job %s completed, starting scale down", job.ID)
 
-					// Now perform the scale down
-					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-					if err := m.stopJob(ctx, job); err != nil {
-						log.Printf("Error stopping completed training job %s: %v", job.ID, err)
+						// Perform scale down
+						ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+						if err := m.stopJob(ctx, job); err != nil {
+							log.Printf("Error stopping completed training job %s: %v", job.ID, err)
+						}
+						cancel()
+						return
+
+					case "error", "failed":
+						// Update error info
+						job.mu.Lock()
+						job.Status = JobStatusError
+						if errMsg, ok := status["error"].(string); ok {
+							job.LastError = fmt.Errorf(errMsg)
+						}
+						now := time.Now()
+						job.StoppedAt = &now
+						job.mu.Unlock()
+
+						log.Printf("Training job %s failed", job.ID)
+
+						// Scale down
+						ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+						m.stopJob(ctx, job)
+						cancel()
+						return
+
+					case "running":
+						// Still running, continue monitoring
+						log.Printf("Training job %s still running", job.ID)
+
+					default:
+						log.Printf("Unknown training status for job %s: %s", job.ID, statusStr)
 					}
-					cancel()
-					return
-
-				case "error", "failed":
-					// Update error info before stopping
-					job.mu.Lock()
-					if errMsg, ok := status["error"].(string); ok {
-						job.LastError = fmt.Errorf(errMsg)
-					}
-					job.mu.Unlock()
-
-					log.Printf("Training job %s failed, stopping and scaling down", job.ID)
-
-					// Use stopJob for failed jobs too
-					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-					if err := m.stopJob(ctx, job); err != nil {
-						log.Printf("Error stopping failed training job %s: %v", job.ID, err)
-					}
-					cancel()
-					return
-
-				case "running":
-					// Continue monitoring
-					log.Printf("Training job %s still running", job.ID)
-
-				default:
-					log.Printf("Unknown training status for job %s: %s", job.ID, statusStr)
 				}
 			}
 		}

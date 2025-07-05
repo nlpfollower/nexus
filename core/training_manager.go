@@ -345,13 +345,11 @@ func (tm *TrainingManager) monitorTraining(ctx context.Context, job *TrainingJob
 		select {
 		case <-ctx.Done():
 			tm.updateJobStatus(job, "error", job.Progress, "Training cancelled")
-			// Move to completed jobs
 			tm.completedJobs.Store(job.JobID, job)
 			tm.jobs.Delete(job.JobID)
 			return
 
 		case <-ticker.C:
-			// Check the orchestration job status using the actual orchestration job ID
 			job.mu.RLock()
 			orchJobID := job.OrchJobID
 			job.mu.RUnlock()
@@ -361,7 +359,7 @@ func (tm *TrainingManager) monitorTraining(ctx context.Context, job *TrainingJob
 				continue
 			}
 
-			// Get orchestration job status
+			// Just check the orchestration job status directly
 			orchJob, exists := tm.orchestrationMgr.GetJob(orchJobID)
 			if !exists {
 				log.Printf("Orchestration job %s not found for training job %s", orchJobID, job.JobID)
@@ -374,37 +372,31 @@ func (tm *TrainingManager) monitorTraining(ctx context.Context, job *TrainingJob
 			trainingCompleted := orchJob.TrainingCompleted
 			orchJob.mu.RUnlock()
 
-			// Check if training was marked as completed by orchestration
-			if trainingCompleted {
+			// Update training job based on orchestration job status
+			switch {
+			case trainingCompleted:
 				tm.updateJobStatus(job, "completed", 1.0, "")
 				job.mu.Lock()
 				now := time.Now()
 				job.CompletedAt = &now
 				job.mu.Unlock()
 				log.Printf("Training job %s completed successfully", job.JobID)
-
-				// Move to completed jobs map
 				tm.completedJobs.Store(job.JobID, job)
 				tm.jobs.Delete(job.JobID)
 				return
-			}
 
-			// Handle orchestration job status
-			switch orchStatus {
-			case JobStatusStopped:
-				tm.updateJobStatus(job, "completed", 1.0, "")
+			case orchStatus == JobStatusStopped:
+				tm.updateJobStatus(job, "stopped", job.Progress, "")
 				job.mu.Lock()
 				now := time.Now()
 				job.CompletedAt = &now
 				job.mu.Unlock()
-				log.Printf("Training job %s completed (orchestration job stopped)", job.JobID)
-
-				// Move to completed jobs map
+				log.Printf("Training job %s stopped", job.JobID)
 				tm.completedJobs.Store(job.JobID, job)
 				tm.jobs.Delete(job.JobID)
 				return
 
-			case JobStatusError:
+			case orchStatus == JobStatusError:
 				errorMsg := "Training failed"
 				if lastError != nil {
 					errorMsg = lastError.Error()
@@ -415,28 +407,14 @@ func (tm *TrainingManager) monitorTraining(ctx context.Context, job *TrainingJob
 				job.CompletedAt = &now
 				job.mu.Unlock()
 				log.Printf("Training job %s failed: %s", job.JobID, errorMsg)
-
-				// Move to completed jobs map
 				tm.completedJobs.Store(job.JobID, job)
 				tm.jobs.Delete(job.JobID)
 				return
 
-			case JobStatusRunning:
-				// Check actual training status from mindlet
-				status, err := tm.orchestrationMgr.GetTrainingStatus(ctx, orchJobID)
-				if err != nil {
-					log.Printf("Error checking training status for job %s: %v", job.JobID, err)
-					continue
-				}
-
-				// Update progress if available
-				if statusStr, ok := status["status"].(string); ok && statusStr == "running" {
-					if progress, ok := status["progress"].(float64); ok {
-						// Map orchestration progress to our progress range (0.5 to 1.0)
-						mappedProgress := 0.5 + (progress * 0.5)
-						tm.updateJobStatus(job, "training", mappedProgress, "")
-					}
-				}
+			case orchStatus == JobStatusRunning:
+				// Just update that we're still training
+				// The orchestration manager handles checking actual training status
+				log.Printf("Training job %s still running", job.JobID)
 			}
 		}
 	}
