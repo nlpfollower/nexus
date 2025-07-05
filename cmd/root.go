@@ -16,6 +16,7 @@ import (
 var (
 	port                 int
 	persistentSessionURL string
+	logDir               string
 )
 
 var rootCmd = &cobra.Command{
@@ -33,12 +34,14 @@ func init() {
 
 	rootCmd.Flags().IntVarP(&port, "port", "p", 8081, "Port to listen on")
 	rootCmd.Flags().StringVarP(&persistentSessionURL, "session", "s", "", "URL for a persistent inference session (e.g. http://localhost:5000)")
+	rootCmd.Flags().StringVar(&logDir, "log-dir", "", "Directory to save inference request logs (e.g. ./logs)")
 }
 
 func runServer(cmd *cobra.Command, args []string) error {
 	// Create configuration
 	cfg := &core.Config{
-		Port: port,
+		Port:   port,
+		LogDir: logDir,
 	}
 
 	// Create and start nexus
@@ -52,6 +55,9 @@ func runServer(cmd *cobra.Command, args []string) error {
 	}
 
 	log.Printf("Nexus server started on port %d", port)
+	if logDir != "" {
+		log.Printf("Request logging enabled to directory: %s", logDir)
+	}
 
 	// Set up signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)

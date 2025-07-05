@@ -2,10 +2,13 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"github.com/nlpfollower/deltamind/database/db"
 	"github.com/nlpfollower/deltamind/orchestration/utils"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -18,7 +21,8 @@ type activeGeneration struct {
 }
 
 type Config struct {
-	Port int
+	Port   int
+	LogDir string // Added: Directory for logging requests
 }
 
 type Nexus struct {
@@ -32,6 +36,11 @@ type Nexus struct {
 	// Add generation tracking
 	// key is requestID.String()
 	activeGenerations *utils.ConcurrentMap[string, *activeGeneration]
+
+	// Logging configuration
+	logDir     string
+	runLogDir  string // Directory for this specific run
+	logEnabled bool
 
 	wg        sync.WaitGroup
 	done      chan struct{}
@@ -59,6 +68,21 @@ func NewNexus(cfg *Config) (*Nexus, error) {
 		orchestrationMgr:  orchestrationMgr,
 		activeGenerations: utils.NewConcurrentMap[string, *activeGeneration](),
 		done:              make(chan struct{}),
+		logDir:            cfg.LogDir,
+		logEnabled:        cfg.LogDir != "",
+	}
+
+	// Set up logging directory if enabled
+	if nexus.logEnabled {
+		// Create run-specific directory with timestamp
+		runTimestamp := time.Now().Format("2006-01-02_15-04-05")
+		nexus.runLogDir = filepath.Join(cfg.LogDir, fmt.Sprintf("run_%s", runTimestamp))
+
+		if err := os.MkdirAll(nexus.runLogDir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create log directory %s: %w", nexus.runLogDir, err)
+		}
+
+		log.Printf("Request logging enabled. Logs will be saved to: %s", nexus.runLogDir)
 	}
 
 	// Create training manager without nexus back reference
@@ -72,6 +96,55 @@ func NewNexus(cfg *Config) (*Nexus, error) {
 	)
 
 	return nexus, nil
+}
+
+// logInferenceRequest saves an inference request to a file
+func (n *Nexus) logInferenceRequest(req *Request, inferReq *InferenceRequest) error {
+	if !n.logEnabled {
+		return nil
+	}
+
+	// Create log entry with metadata
+	logEntry := struct {
+		Timestamp    time.Time `json:"timestamp"`
+		RequestID    string    `json:"request_id"`
+		ConnectionID string    `json:"connection_id"`
+		ModelID      string    `json:"model_id"`
+		ModelSize    string    `json:"model_size,omitempty"`
+		Checkpoint   string    `json:"checkpoint_path,omitempty"`
+		Messages     []Message `json:"messages"`
+		RequestType  string    `json:"request_type"`
+		IsAPIModel   bool      `json:"is_api_model"`
+	}{
+		Timestamp:    time.Now(),
+		RequestID:    req.RequestID.String(),
+		ConnectionID: req.ConnectionID,
+		ModelID:      inferReq.ModelID,
+		ModelSize:    inferReq.ModelSize,
+		Checkpoint:   inferReq.CheckpointPath,
+		Messages:     inferReq.Messages,
+		RequestType:  "inference",
+		IsAPIModel:   n.apiManager.IsAPIModel(db.NewDigest([]byte(inferReq.ModelID))),
+	}
+
+	// Generate filename with timestamp and request ID
+	timestamp := time.Now().Format("2006-01-02_15-04-05.000")
+	filename := fmt.Sprintf("request_%s_%s.json", timestamp, req.RequestID.String()[:8])
+	filepath := filepath.Join(n.runLogDir, filename)
+
+	// Marshal to JSON with indentation
+	data, err := json.MarshalIndent(logEntry, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	// Write to file
+	if err := os.WriteFile(filepath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write request log: %w", err)
+	}
+
+	log.Printf("Logged inference request to: %s", filename)
+	return nil
 }
 
 func (n *Nexus) Start() error {
@@ -233,6 +306,12 @@ func (n *Nexus) handleInference(req *Request) error {
 	inferReq, ok := req.Data.(*InferenceRequest)
 	if !ok {
 		return fmt.Errorf("invalid inference request data")
+	}
+
+	// Log the inference request
+	if err := n.logInferenceRequest(req, inferReq); err != nil {
+		// Log error but don't fail the request
+		log.Printf("Failed to log inference request: %v", err)
 	}
 
 	// Convert string to digest for API model check
