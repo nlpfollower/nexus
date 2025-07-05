@@ -203,7 +203,7 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 	datasetJSON, err := json.Marshal(dataset)
 	require.NoError(t, err)
 
-	// Create training request
+	// Create training request with a consistent job ID
 	requestID := db.NewDigest([]byte(uuid.New().String()))
 	jobID := fmt.Sprintf("test-training-job-%d", time.Now().Unix())
 
@@ -242,6 +242,7 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 	maxStatusChecks := 90 // 15 minutes max
 	datasetProcessed := false
 	trainingStarted := false
+	trainingCompleted := false
 	lastStatus := ""
 
 	for statusCheckCount < maxStatusChecks {
@@ -287,12 +288,20 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 			t.Log("Training is being initialized...")
 		}
 
-		if job.Status == "training" && job.Progress > 0.5 {
-			// Only consider training as started if we're past the initial setup
+		if job.Status == "training" {
+			// Training has started - set the flag
 			trainingStarted = true
-			t.Log("Training has started and is making progress")
-			// Continue monitoring for a bit to ensure it's stable
-			time.Sleep(10 * time.Second)
+			t.Log("Training has started")
+
+			// Continue monitoring for a bit to see progress
+			if job.Progress > 0.5 {
+				t.Logf("Training is making progress: %.2f%%", job.Progress*100)
+			}
+		}
+
+		if job.Status == "completed" {
+			trainingCompleted = true
+			t.Log("Training has completed successfully")
 			break
 		}
 
@@ -307,6 +316,7 @@ func TestNexusTrainingWithDataset(t *testing.T) {
 	// Verify the job progressed through expected stages
 	require.True(t, datasetProcessed, "Dataset should have been processed")
 	require.True(t, trainingStarted, "Training should have started")
+	require.True(t, trainingCompleted, "Training should have completed successfully")
 
 	// Final verification - send one more status request
 	finalStatusReq := &TrainingStatusRequest{

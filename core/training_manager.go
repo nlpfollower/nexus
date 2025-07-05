@@ -12,14 +12,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/nlpfollower/deltamind/database/db"
 )
 
 // TrainingJob represents an active training job
 type TrainingJob struct {
-	ID            string
-	JobID         string // From training request
+	ID            string // Internal ID (not used externally)
+	JobID         string // From training request - this is the primary identifier
 	UserID        db.Digest
 	SourceModelID string
 	TargetModelID string
@@ -30,6 +29,7 @@ type TrainingJob struct {
 	CompletedAt   *time.Time
 	DatasetPath   string // Path where processed dataset is stored
 	NodeCount     int    // Number of nodes used for training
+	OrchJobID     string // Orchestration job ID for tracking
 	mu            sync.RWMutex
 }
 
@@ -55,7 +55,7 @@ type ProcessDatasetResponse struct {
 
 // TrainingManager manages training jobs
 type TrainingManager struct {
-	jobs             *sync.Map // map[string]*TrainingJob
+	jobs             *sync.Map // map[string]*TrainingJob - keyed by JobID from request
 	orchestrationMgr *OrchestrationManager
 }
 
@@ -98,9 +98,9 @@ func (tm *TrainingManager) StartTraining(ctx context.Context, req *TrainingReque
 	log.Printf("Context messages: %d, Training prompt length: %d",
 		len(dataset.ContextMessages), len(dataset.TrainingPrompt))
 
-	// Create training job
+	// Create training job - use JobID from request as the primary key
 	job := &TrainingJob{
-		ID:            uuid.New().String(),
+		ID:            req.JobID, // Use same ID for simplicity
 		JobID:         req.JobID,
 		UserID:        req.UserID,
 		SourceModelID: req.SourceModelID,
@@ -111,7 +111,7 @@ func (tm *TrainingManager) StartTraining(ctx context.Context, req *TrainingReque
 		NodeCount:     nodeCount,
 	}
 
-	// Store the job
+	// Store the job using JobID as key
 	tm.jobs.Store(req.JobID, job)
 
 	// Start processing in background
@@ -145,6 +145,7 @@ func (tm *TrainingManager) GetJobStatus(jobID string) (*TrainingJob, error) {
 		CompletedAt:   job.CompletedAt,
 		DatasetPath:   job.DatasetPath,
 		NodeCount:     job.NodeCount,
+		OrchJobID:     job.OrchJobID,
 	}
 
 	return jobCopy, nil
@@ -304,6 +305,7 @@ func (tm *TrainingManager) startTrainingProcess(ctx context.Context, job *Traini
 		"node_count":      job.NodeCount, // Use determined node count
 		"raid_mount_path": "/mnt/cold",   // Add RAID mount path
 		"raid_name":       "cold-new",    // Add RAID name
+		"training_job_id": job.JobID,     // Pass the training job ID for tracking
 	}
 
 	// Start training via orchestration manager
@@ -311,6 +313,11 @@ func (tm *TrainingManager) startTrainingProcess(ctx context.Context, job *Traini
 	if err != nil {
 		return fmt.Errorf("failed to start training orchestration: %w", err)
 	}
+
+	// Store orchestration job ID for tracking
+	job.mu.Lock()
+	job.OrchJobID = orchJob.ID
+	job.mu.Unlock()
 
 	// Update job status
 	tm.updateJobStatus(job, "training", 0.5, "")
@@ -333,40 +340,62 @@ func (tm *TrainingManager) monitorTraining(ctx context.Context, job *TrainingJob
 			return
 
 		case <-ticker.C:
-			// Get training status from orchestration
-			status, err := tm.orchestrationMgr.GetTrainingStatus(ctx, job.TargetModelID)
-			if err != nil {
-				log.Printf("Error checking training status for job %s: %v", job.JobID, err)
+			// Check the orchestration job status using the actual orchestration job ID
+			job.mu.RLock()
+			orchJobID := job.OrchJobID
+			job.mu.RUnlock()
+
+			if orchJobID == "" {
+				log.Printf("No orchestration job ID for training job %s", job.JobID)
 				continue
 			}
 
-			// Update job based on orchestration status
-			if statusStr, ok := status["status"].(string); ok {
-				switch statusStr {
-				case "completed":
-					tm.updateJobStatus(job, "completed", 1.0, "")
-					job.mu.Lock()
-					now := time.Now()
-					job.CompletedAt = &now
-					job.mu.Unlock()
-					log.Printf("Training job %s completed successfully", job.JobID)
-					return
+			// Get orchestration job status
+			orchJob, exists := tm.orchestrationMgr.GetJob(orchJobID)
+			if !exists {
+				log.Printf("Orchestration job %s not found for training job %s", orchJobID, job.JobID)
+				continue
+			}
 
-				case "error", "failed":
-					errorMsg := "Training failed"
-					if errStr, ok := status["error"].(string); ok {
-						errorMsg = errStr
-					}
-					tm.updateJobStatus(job, "error", job.Progress, errorMsg)
-					job.mu.Lock()
-					now := time.Now()
-					job.CompletedAt = &now
-					job.mu.Unlock()
-					log.Printf("Training job %s failed: %s", job.JobID, errorMsg)
-					return
+			orchJob.mu.RLock()
+			orchStatus := orchJob.Status
+			lastError := orchJob.LastError
+			orchJob.mu.RUnlock()
 
-				case "running":
-					// Update progress if available
+			// Handle orchestration job status
+			switch orchStatus {
+			case JobStatusStopped:
+				tm.updateJobStatus(job, "completed", 1.0, "")
+				job.mu.Lock()
+				now := time.Now()
+				job.CompletedAt = &now
+				job.mu.Unlock()
+				log.Printf("Training job %s completed (orchestration job stopped)", job.JobID)
+				return
+
+			case JobStatusError:
+				errorMsg := "Training failed"
+				if lastError != nil {
+					errorMsg = lastError.Error()
+				}
+				tm.updateJobStatus(job, "error", job.Progress, errorMsg)
+				job.mu.Lock()
+				now := time.Now()
+				job.CompletedAt = &now
+				job.mu.Unlock()
+				log.Printf("Training job %s failed: %s", job.JobID, errorMsg)
+				return
+
+			case JobStatusRunning:
+				// Check actual training status from mindlet
+				status, err := tm.orchestrationMgr.GetTrainingStatus(ctx, orchJobID)
+				if err != nil {
+					log.Printf("Error checking training status for job %s: %v", job.JobID, err)
+					continue
+				}
+
+				// Update progress if available
+				if statusStr, ok := status["status"].(string); ok && statusStr == "running" {
 					if progress, ok := status["progress"].(float64); ok {
 						// Map orchestration progress to our progress range (0.5 to 1.0)
 						mappedProgress := 0.5 + (progress * 0.5)

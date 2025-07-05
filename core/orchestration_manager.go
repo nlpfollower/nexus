@@ -166,7 +166,13 @@ func (m *OrchestrationManager) StartInferenceJob(ctx context.Context, modelID st
 }
 
 func (m *OrchestrationManager) StartTrainingJob(ctx context.Context, targetModelID string, config map[string]interface{}) (*OrchestrationJob, error) {
-	jobID := uuid.New().String()
+	// Use the training job ID if provided, otherwise generate one
+	jobID := ""
+	if trainingJobID, ok := config["training_job_id"].(string); ok && trainingJobID != "" {
+		jobID = trainingJobID
+	} else {
+		jobID = uuid.New().String()
+	}
 
 	job := &OrchestrationJob{
 		ID:         jobID,
