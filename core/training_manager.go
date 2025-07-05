@@ -55,7 +55,8 @@ type ProcessDatasetResponse struct {
 
 // TrainingManager manages training jobs
 type TrainingManager struct {
-	jobs             *sync.Map // map[string]*TrainingJob - keyed by JobID from request
+	jobs             *sync.Map
+	completedJobs    *sync.Map
 	orchestrationMgr *OrchestrationManager
 }
 
@@ -63,6 +64,7 @@ type TrainingManager struct {
 func NewTrainingManager(orchestrationMgr *OrchestrationManager) *TrainingManager {
 	return &TrainingManager{
 		jobs:             &sync.Map{},
+		completedJobs:    &sync.Map{},
 		orchestrationMgr: orchestrationMgr,
 	}
 }
@@ -122,17 +124,25 @@ func (tm *TrainingManager) StartTraining(ctx context.Context, req *TrainingReque
 
 // GetJobStatus returns the status of a training job
 func (tm *TrainingManager) GetJobStatus(jobID string) (*TrainingJob, error) {
-	value, ok := tm.jobs.Load(jobID)
-	if !ok {
-		return nil, fmt.Errorf("training job not found: %s", jobID)
+	// Try active jobs first
+	if value, ok := tm.jobs.Load(jobID); ok {
+		return copyJob(value.(*TrainingJob)), nil
 	}
 
-	job := value.(*TrainingJob)
+	// Then check completed jobs
+	if value, ok := tm.completedJobs.Load(jobID); ok {
+		return copyJob(value.(*TrainingJob)), nil
+	}
+
+	return nil, fmt.Errorf("training job not found: %s", jobID)
+}
+
+// copyJob returns a deep copy of the given TrainingJob
+func copyJob(job *TrainingJob) *TrainingJob {
 	job.mu.RLock()
 	defer job.mu.RUnlock()
 
-	// Return a copy to avoid race conditions
-	jobCopy := &TrainingJob{
+	return &TrainingJob{
 		ID:            job.ID,
 		JobID:         job.JobID,
 		UserID:        job.UserID,
@@ -147,8 +157,6 @@ func (tm *TrainingManager) GetJobStatus(jobID string) (*TrainingJob, error) {
 		NodeCount:     job.NodeCount,
 		OrchJobID:     job.OrchJobID,
 	}
-
-	return jobCopy, nil
 }
 
 // processTraining handles the training workflow
@@ -337,6 +345,9 @@ func (tm *TrainingManager) monitorTraining(ctx context.Context, job *TrainingJob
 		select {
 		case <-ctx.Done():
 			tm.updateJobStatus(job, "error", job.Progress, "Training cancelled")
+			// Move to completed jobs
+			tm.completedJobs.Store(job.JobID, job)
+			tm.jobs.Delete(job.JobID)
 			return
 
 		case <-ticker.C:
@@ -360,7 +371,23 @@ func (tm *TrainingManager) monitorTraining(ctx context.Context, job *TrainingJob
 			orchJob.mu.RLock()
 			orchStatus := orchJob.Status
 			lastError := orchJob.LastError
+			trainingCompleted := orchJob.TrainingCompleted
 			orchJob.mu.RUnlock()
+
+			// Check if training was marked as completed by orchestration
+			if trainingCompleted {
+				tm.updateJobStatus(job, "completed", 1.0, "")
+				job.mu.Lock()
+				now := time.Now()
+				job.CompletedAt = &now
+				job.mu.Unlock()
+				log.Printf("Training job %s completed successfully", job.JobID)
+
+				// Move to completed jobs map
+				tm.completedJobs.Store(job.JobID, job)
+				tm.jobs.Delete(job.JobID)
+				return
+			}
 
 			// Handle orchestration job status
 			switch orchStatus {
@@ -371,7 +398,10 @@ func (tm *TrainingManager) monitorTraining(ctx context.Context, job *TrainingJob
 				job.CompletedAt = &now
 				job.mu.Unlock()
 				log.Printf("Training job %s completed (orchestration job stopped)", job.JobID)
-				// DON'T remove from map - keep it for future status queries
+
+				// Move to completed jobs map
+				tm.completedJobs.Store(job.JobID, job)
+				tm.jobs.Delete(job.JobID)
 				return
 
 			case JobStatusError:
@@ -385,7 +415,10 @@ func (tm *TrainingManager) monitorTraining(ctx context.Context, job *TrainingJob
 				job.CompletedAt = &now
 				job.mu.Unlock()
 				log.Printf("Training job %s failed: %s", job.JobID, errorMsg)
-				// DON'T remove from map - keep it for future status queries
+
+				// Move to completed jobs map
+				tm.completedJobs.Store(job.JobID, job)
+				tm.jobs.Delete(job.JobID)
 				return
 
 			case JobStatusRunning:
