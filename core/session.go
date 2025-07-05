@@ -98,7 +98,7 @@ func (s *InferenceSession) ProcessInference(ctx context.Context, messages []Mess
 		CheckpointPath: s.CheckpointPath, // Include checkpoint path if set
 		ModelSize:      s.ModelSize,      // Include model size if set
 		Messages:       messages,
-		MaxTokens:      300,
+		MaxTokens:      1500,
 	}
 
 	// Serialize request body
