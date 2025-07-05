@@ -34,6 +34,10 @@ type OrchestrationJob struct {
 	LastError  error
 	Endpoint   string // For inference jobs
 	mu         sync.RWMutex
+
+	// Add fields for training completion tracking
+	TrainingCompleted bool
+	CompletedAt       *time.Time
 }
 
 // InferenceConfig contains inference-specific configuration
@@ -52,6 +56,7 @@ type InferenceConfig struct {
 // OrchestrationManager manages inference and training jobs via the orchestration CLI
 type OrchestrationManager struct {
 	jobs              *utils.ConcurrentMap[string, *OrchestrationJob]
+	completedJobs     *utils.ConcurrentMap[string, *OrchestrationJob]
 	defaultExpiration time.Duration
 	orchestrationDir  string // Directory where orchestration code lives
 
@@ -75,6 +80,7 @@ func NewOrchestrationManager(defaultExpiration time.Duration) (*OrchestrationMan
 
 	manager := &OrchestrationManager{
 		jobs:              utils.NewConcurrentMap[string, *OrchestrationJob](),
+		completedJobs:     utils.NewConcurrentMap[string, *OrchestrationJob](),
 		defaultExpiration: defaultExpiration,
 		orchestrationDir:  orchestrationDir,
 		done:              make(chan struct{}),
@@ -100,28 +106,22 @@ func (m *OrchestrationManager) Stop() {
 		log.Println("Orchestration manager stopping...")
 		close(m.done)
 
-		// Stop all running jobs with proper cleanup
+		// CRITICAL: Stop all running jobs before shutdown
+		log.Printf("Stopping all running jobs for clean shutdown...")
 		runningJobs := m.GetRunningJobs()
-		if len(runningJobs) > 0 {
-			log.Printf("Stopping %d running jobs for clean shutdown", len(runningJobs))
+		for _, job := range runningJobs {
+			job.mu.Lock()
+			jobID := job.ID
+			status := job.Status
+			job.mu.Unlock()
 
-			for _, job := range runningJobs {
-				job.mu.RLock()
-				jobID := job.ID
-				jobType := job.Type
-				status := job.Status
-				job.mu.RUnlock()
-
-				if status == JobStatusRunning || status == JobStatusInitializing {
-					log.Printf("Stopping %s job %s", jobType, jobID)
-					ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-					if err := m.stopJob(ctx, job); err != nil {
-						log.Printf("Error stopping job %s: %v", jobID, err)
-					} else {
-						log.Printf("Successfully stopped job %s", jobID)
-					}
-					cancel()
+			if status == JobStatusRunning || status == JobStatusInitializing {
+				log.Printf("Stopping job %s for clean shutdown", jobID)
+				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+				if err := m.stopJob(ctx, job); err != nil {
+					log.Printf("Error stopping job %s during shutdown: %v", jobID, err)
 				}
+				cancel()
 			}
 		}
 
@@ -200,15 +200,29 @@ func (m *OrchestrationManager) StartTrainingJob(ctx context.Context, targetModel
 	return job, nil
 }
 
-// GetJob retrieves a job by ID
+// GetJob retrieves a job by ID - checks both active and completed jobs
 func (m *OrchestrationManager) GetJob(jobID string) (*OrchestrationJob, bool) {
-	return m.jobs.Get(jobID)
+	// First check active jobs
+	if job, ok := m.jobs.Get(jobID); ok {
+		return job, true
+	}
+	// Then check completed jobs
+	if job, ok := m.completedJobs.Get(jobID); ok {
+		return job, true
+	}
+	return nil, false
 }
 
 // GetJobsByType returns all jobs of a specific type
 func (m *OrchestrationManager) GetJobsByType(jobType OrchestrationJobType) []*OrchestrationJob {
 	var jobs []*OrchestrationJob
 	for _, job := range m.jobs.GetAll() {
+		if job.Type == jobType {
+			jobs = append(jobs, job)
+		}
+	}
+	// Also check completed jobs
+	for _, job := range m.completedJobs.GetAll() {
 		if job.Type == jobType {
 			jobs = append(jobs, job)
 		}
@@ -233,7 +247,7 @@ func (m *OrchestrationManager) GetRunningJobs() []*OrchestrationJob {
 
 // StopJob stops a specific job
 func (m *OrchestrationManager) StopJob(ctx context.Context, jobID string) error {
-	job, exists := m.jobs.Get(jobID)
+	job, exists := m.GetJob(jobID)
 	if !exists {
 		return fmt.Errorf("job not found: %s", jobID)
 	}
@@ -282,6 +296,13 @@ func (m *OrchestrationManager) stopJob(ctx context.Context, job *OrchestrationJo
 		log.Printf("Job %s stopped successfully", jobID)
 	}
 	job.mu.Unlock()
+
+	// Move to completed jobs map for training jobs
+	if jobType == JobTypeTraining {
+		m.completedJobs.Set(jobID, job)
+		m.jobs.Remove(jobID)
+		log.Printf("Moved training job %s to completed jobs", jobID)
+	}
 
 	return err
 }
@@ -390,7 +411,7 @@ func (m *OrchestrationManager) ExtendJob(jobID string, duration time.Duration) e
 
 // GetJobStatus retrieves the current status of a job
 func (m *OrchestrationManager) GetJobStatus(ctx context.Context, jobID string) (*JobStatusInfo, error) {
-	job, exists := m.jobs.Get(jobID)
+	job, exists := m.GetJob(jobID)
 	if !exists {
 		return nil, fmt.Errorf("job not found: %s", jobID)
 	}
@@ -524,14 +545,28 @@ func (m *OrchestrationManager) GetOrCreateInferenceSession(ctx context.Context, 
 
 // GetTrainingStatus gets the status of a training job from orchestration
 func (m *OrchestrationManager) GetTrainingStatus(ctx context.Context, jobID string) (map[string]interface{}, error) {
-	job, exists := m.jobs.Get(jobID)
+	job, exists := m.GetJob(jobID)
 	if !exists {
 		return nil, fmt.Errorf("training job not found: %s", jobID)
 	}
 
 	job.mu.RLock()
 	status := job.Status
+	trainingCompleted := job.TrainingCompleted
+	completedAt := job.CompletedAt
 	job.mu.RUnlock()
+
+	// For completed training jobs, return cached status
+	if trainingCompleted {
+		result := map[string]interface{}{
+			"status": "completed",
+			"job_id": jobID,
+		}
+		if completedAt != nil {
+			result["completed_at"] = *completedAt
+		}
+		return result, nil
+	}
 
 	// For running training jobs, check live status
 	if status == JobStatusRunning {
@@ -944,9 +979,16 @@ func (m *OrchestrationManager) monitorTrainingProgress(job *OrchestrationJob) {
 			if statusStr, ok := status["status"].(string); ok {
 				switch statusStr {
 				case "completed":
-					log.Printf("Training job %s completed, stopping and scaling down", job.ID)
+					// Mark training as completed BEFORE scaling down
+					job.mu.Lock()
+					job.TrainingCompleted = true
+					now := time.Now()
+					job.CompletedAt = &now
+					job.mu.Unlock()
 
-					// Use stopJob which handles status updates properly
+					log.Printf("Training job %s completed (orchestration job stopping), starting scale down", job.ID)
+
+					// Now perform the scale down
 					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 					if err := m.stopJob(ctx, job); err != nil {
 						log.Printf("Error stopping completed training job %s: %v", job.ID, err)

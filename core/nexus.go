@@ -587,7 +587,7 @@ func (n *Nexus) handleTraining(req *Request) error {
 	return nil
 }
 
-// Add handler for training status requests
+// handleTrainingStatus handles training status requests
 func (n *Nexus) handleTrainingStatus(req *Request) error {
 	statusReq, ok := req.Data.(*TrainingStatusRequest)
 	if !ok {
@@ -595,6 +595,7 @@ func (n *Nexus) handleTrainingStatus(req *Request) error {
 	}
 
 	// Get job status from training manager
+	// The training manager will check orchestration for completed jobs
 	job, err := n.trainingMgr.GetJobStatus(statusReq.JobID)
 	if err != nil {
 		return fmt.Errorf("failed to get training status: %w", err)

@@ -360,7 +360,20 @@ func (tm *TrainingManager) monitorTraining(ctx context.Context, job *TrainingJob
 			orchJob.mu.RLock()
 			orchStatus := orchJob.Status
 			lastError := orchJob.LastError
+			trainingCompleted := orchJob.TrainingCompleted
 			orchJob.mu.RUnlock()
+
+			// Check if training was marked as completed FIRST
+			if trainingCompleted {
+				tm.updateJobStatus(job, "completed", 1.0, "")
+				job.mu.Lock()
+				now := time.Now()
+				job.CompletedAt = &now
+				job.mu.Unlock()
+				log.Printf("Training job %s completed successfully", job.JobID)
+				// Don't remove from map - let it stay for status queries
+				return
+			}
 
 			// Handle orchestration job status
 			switch orchStatus {
