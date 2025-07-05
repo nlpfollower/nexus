@@ -198,7 +198,7 @@ func (n *Nexus) Stop() {
 
 			if status == JobStatusRunning || status == JobStatusInitializing {
 				log.Printf("Stopping job %s for clean shutdown", jobID)
-				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 				if err := n.orchestrationMgr.StopJob(ctx, jobID); err != nil {
 					log.Printf("Error stopping job %s during shutdown: %v", jobID, err)
 				}
