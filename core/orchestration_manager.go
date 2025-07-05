@@ -556,7 +556,7 @@ func (m *OrchestrationManager) GetTrainingStatus(ctx context.Context, jobID stri
 	completedAt := job.CompletedAt
 	job.mu.RUnlock()
 
-	// For completed training jobs, return cached status
+	// For completed training jobs, return cached status without calling mindlet
 	if trainingCompleted {
 		result := map[string]interface{}{
 			"status": "completed",
@@ -568,8 +568,26 @@ func (m *OrchestrationManager) GetTrainingStatus(ctx context.Context, jobID stri
 		return result, nil
 	}
 
-	// For running training jobs, check live status
-	if status == JobStatusRunning {
+	// For stopped/error jobs, also return cached status
+	if status == JobStatusStopped || status == JobStatusError {
+		result := map[string]interface{}{
+			"status": string(status),
+			"job_id": jobID,
+		}
+
+		if status == JobStatusError {
+			job.mu.RLock()
+			if job.LastError != nil {
+				result["error"] = job.LastError.Error()
+			}
+			job.mu.RUnlock()
+		}
+
+		return result, nil
+	}
+
+	// Only check live status for running/initializing jobs
+	if status == JobStatusRunning || status == JobStatusInitializing {
 		liveStatus, err := m.checkTrainingStatus(ctx, jobID)
 		if err != nil {
 			// Return basic status if live check fails
@@ -599,22 +617,11 @@ func (m *OrchestrationManager) GetTrainingStatus(ctx context.Context, jobID stri
 		return liveStatus, nil
 	}
 
-	// Return basic status for non-running jobs
-	result := map[string]interface{}{
+	// Return basic status for other states
+	return map[string]interface{}{
 		"status": string(status),
 		"job_id": jobID,
-	}
-
-	// Add error information if available
-	if status == JobStatusError {
-		job.mu.RLock()
-		if job.LastError != nil {
-			result["error"] = job.LastError.Error()
-		}
-		job.mu.RUnlock()
-	}
-
-	return result, nil
+	}, nil
 }
 
 // executeOrchestrationCommand runs a command in the orchestration directory
@@ -968,6 +975,16 @@ func (m *OrchestrationManager) monitorTrainingProgress(job *OrchestrationJob) {
 	for {
 		select {
 		case <-ticker.C:
+			// First check if we already marked this as completed
+			job.mu.RLock()
+			alreadyCompleted := job.TrainingCompleted
+			job.mu.RUnlock()
+
+			if alreadyCompleted {
+				// Already handled, stop monitoring
+				return
+			}
+
 			// Check training status using mindlet train status command
 			status, err := m.checkTrainingStatus(context.Background(), job.ID)
 			if err != nil {
