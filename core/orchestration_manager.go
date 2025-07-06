@@ -495,7 +495,7 @@ func (m *OrchestrationManager) GetOrCreateInferenceSession(ctx context.Context, 
 	}
 
 	// Wait for the job to be ready
-	readyCtx, cancel := context.WithTimeout(ctx, 6*time.Minute)
+	readyCtx, cancel := context.WithTimeout(ctx, 20*time.Minute)
 	defer cancel()
 
 	ticker := time.NewTicker(5 * time.Second)
