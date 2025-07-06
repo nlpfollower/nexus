@@ -843,7 +843,7 @@ func (m *OrchestrationManager) getNodeCountFromConfig(config map[string]interfac
 func (m *OrchestrationManager) determineNodeCountFromModelSize(modelSize string) int {
 	switch strings.ToLower(modelSize) {
 	case "70b":
-		return 2 // 70B models need 2 nodes
+		return 3 // 70B models need 2 nodes
 	case "8b", "3b":
 		return 1 // Smaller models use 1 node
 	default:

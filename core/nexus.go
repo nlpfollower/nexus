@@ -56,7 +56,7 @@ func NewNexus(cfg *Config) (*Nexus, error) {
 	queue := NewMessageChannel(1000, 1000)
 
 	// Create orchestration manager with default 30 minute expiration
-	orchestrationMgr, err := NewOrchestrationManager(30 * time.Minute)
+	orchestrationMgr, err := NewOrchestrationManager(60 * time.Minute)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create orchestration manager: %w", err)
 	}
