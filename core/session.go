@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -87,6 +86,7 @@ func (s *InferenceSession) ProcessInference(ctx context.Context, messages []Mess
 	}
 
 	// Create the request body for mindlet API
+	// Include checkpoint_path to support cloned models
 	reqBody := struct {
 		ModelID        string    `json:"model_id"`
 		CheckpointPath string    `json:"checkpoint_path,omitempty"`
@@ -95,8 +95,8 @@ func (s *InferenceSession) ProcessInference(ctx context.Context, messages []Mess
 		MaxTokens      int       `json:"max_tokens"`
 	}{
 		ModelID:        s.ModelID,
-		CheckpointPath: s.CheckpointPath,
-		ModelSize:      s.ModelSize,
+		CheckpointPath: s.CheckpointPath, // Include checkpoint path if set
+		ModelSize:      s.ModelSize,      // Include model size if set
 		Messages:       messages,
 		MaxTokens:      1500,
 	}
@@ -106,10 +106,6 @@ func (s *InferenceSession) ProcessInference(ctx context.Context, messages []Mess
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request body: %w", err)
 	}
-
-	// Log request size for debugging
-	log.Printf("Sending inference request: %d bytes (%.2f MB) with %d messages",
-		len(jsonBody), float64(len(jsonBody))/(1024*1024), len(messages))
 
 	// Create HTTP request to mindlet's streaming endpoint
 	endpointURL := s.Endpoint.String()
@@ -125,22 +121,6 @@ func (s *InferenceSession) ProcessInference(ctx context.Context, messages []Mess
 		log.Printf("Using checkpoint path: %s", s.CheckpointPath)
 	}
 
-	// Create a dedicated HTTP client for this request
-	httpClient := &http.Client{
-		Timeout: 30 * time.Minute, // Increase timeout for large requests
-		Transport: &http.Transport{
-			MaxIdleConns:           10,
-			MaxIdleConnsPerHost:    10,
-			IdleConnTimeout:        90 * time.Second,
-			ResponseHeaderTimeout:  60 * time.Second,
-			ExpectContinueTimeout:  1 * time.Second,
-			MaxResponseHeaderBytes: 1 << 20, // 1 MB
-			WriteBufferSize:        1 << 20, // 1 MB
-			ReadBufferSize:         1 << 20, // 1 MB
-			DisableCompression:     true,
-		},
-	}
-
 	// Use a background context for the HTTP request to avoid cancellation issues
 	req, err := http.NewRequestWithContext(context.Background(), "POST", endpointURL, bytes.NewBuffer(jsonBody))
 	if err != nil {
@@ -148,14 +128,12 @@ func (s *InferenceSession) ProcessInference(ctx context.Context, messages []Mess
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "text/event-stream")
-	req.ContentLength = int64(len(jsonBody))
+	req.Header.Set("Accept", "text/event-stream") // For SSE responses
 
 	// Make the request
-	startTime := time.Now()
-	resp, err := httpClient.Do(req)
+	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to execute request after %v: %w", time.Since(startTime), err)
+		return nil, fmt.Errorf("failed to execute request: %w", err)
 	}
 
 	// Check response status
@@ -164,8 +142,6 @@ func (s *InferenceSession) ProcessInference(ctx context.Context, messages []Mess
 		resp.Body.Close()
 		return nil, fmt.Errorf("mindlet endpoint returned error: %s - %s", resp.Status, string(body))
 	}
-
-	log.Printf("Got response from mindlet after %v, starting stream processing", time.Since(startTime))
 
 	// Create a stream to handle the response
 	stream, streamCtx := newBaseGenerationStream(ctx)
@@ -176,46 +152,32 @@ func (s *InferenceSession) ProcessInference(ctx context.Context, messages []Mess
 		defer stream.Stop()
 
 		reader := bufio.NewReader(resp.Body)
-		messageCount := 0
-		totalBytes := 0
 
 		for {
 			select {
 			case <-streamCtx.Done():
-				log.Printf("Stream context cancelled after %d messages", messageCount)
+				log.Printf("Stream context cancelled")
 				return
 			default:
-				// Set a read deadline to prevent hanging
-				if conn, ok := resp.Body.(interface{ SetReadDeadline(time.Time) error }); ok {
-					conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
-				}
-
-				// Read SSE message
+				// Read SSE message (which may span multiple lines)
 				sseMessage, err := s.readSSEMessage(reader)
 				if err != nil {
 					if err == io.EOF {
-						log.Printf("Stream ended (EOF) after %d messages, %d bytes", messageCount, totalBytes)
+						log.Printf("Stream ended (EOF)")
 						return
 					}
-
-					// Check if it's a timeout
-					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-						log.Printf("Read timeout after %d messages, closing stream", messageCount)
-						return
-					}
-
-					log.Printf("Error reading SSE message after %d messages: %v", messageCount, err)
+					// Only log non-EOF errors
+					log.Printf("Error reading SSE message: %v", err)
 					if !strings.Contains(err.Error(), "context canceled") {
 						stream.SendResponse(ModelResponse{Error: err})
 					}
 					return
 				}
 
+				// Process the SSE message
 				if sseMessage == "" {
-					continue
+					continue // Empty message, skip
 				}
-
-				totalBytes += len(sseMessage)
 
 				// Parse data lines from the SSE message
 				lines := strings.Split(sseMessage, "\n")
@@ -229,11 +191,11 @@ func (s *InferenceSession) ProcessInference(ctx context.Context, messages []Mess
 
 					// Check for end of stream
 					if dataContent == "[DONE]" {
-						log.Printf("Received [DONE] signal after %d messages", messageCount)
+						log.Printf("Received [DONE] signal")
 						return
 					}
 
-					// Parse JSON response
+					// Parse JSON response (mindlet forwards VLLM format)
 					var streamResp InferenceEndpointResponse
 					if err := json.Unmarshal([]byte(dataContent), &streamResp); err != nil {
 						log.Printf("Error parsing JSON: %v, data: %s", err, dataContent)
@@ -244,25 +206,17 @@ func (s *InferenceSession) ProcessInference(ctx context.Context, messages []Mess
 					if len(streamResp.Choices) > 0 {
 						choice := streamResp.Choices[0]
 
+						// Check for finish reason
 						if choice.FinishReason == "stop" {
-							log.Printf("Received finish_reason: stop after %d messages", messageCount)
+							log.Printf("Received finish_reason: stop")
 							return
 						}
 
+						// Extract and send content
 						if choice.Delta.Content != "" {
-							messageCount++
-
-							// Try to send with timeout
-							sendStart := time.Now()
 							if !stream.SendResponse(ModelResponse{Content: choice.Delta.Content}) {
-								log.Printf("Failed to send response %d after %v, channel might be blocked or closed",
-									messageCount, time.Since(sendStart))
+								log.Printf("Failed to send response, channel might be closed")
 								return
-							}
-
-							// Log progress every 100 messages
-							if messageCount%100 == 0 {
-								log.Printf("Processed %d messages, %d bytes total", messageCount, totalBytes)
 							}
 						}
 					}
